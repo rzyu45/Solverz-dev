@@ -2,6 +2,67 @@
 
 # Release Notes
 
+## 0.8.6
+
+Mat_Mul fallback diagnostic warnings (#125). When a `Mat_Mul`
+placeholder or a mutable Jacobian block is forced onto the slower
+scipy.sparse fallback path, the module printer now emits a
+`UserWarning` that tells the user *what* expression broke the fast
+path, *why*, and *how to rewrite* it.
+
+### New
+
+- **Layer 1 `Mat_Mul` placeholder fallback warnings.** The module
+  printer's `print_F` now emits one `UserWarning` per fallback
+  placeholder, with specialised messages for negation, scalar
+  multiplication, sum-of-matrices, multi-argument `Mat_Mul` folding,
+  sparse `dim=2` `Param` references in the operand, and demotion
+  cascades (root-cause traceback).
+
+- **Layer 2 mutable Jacobian block fallback warnings.** When a
+  Jacobian block term doesn't match the `Diag` / row-scale /
+  col-scale / biscale fast-path shapes, the module printer emits a
+  `UserWarning` naming the equation, variable, and offending term.
+
+- **`matrix_calculus.md` diagnostic warnings section** listing every
+  warning category, what triggers it, and the canonical fix.
+
+### Changed
+
+- Warnings only fire in module mode (not inline), because inline
+  mode has no fast/fallback split. The existing
+  `_warn_dense_matmul_params` warning (from `FormJac` time) still
+  fires in both modes.
+
+### Fixed
+
+- **`Mat_Mul` printer associativity.** When the matrix argument was
+  a non-atomic expression such as `A + B` or `2 * A`, `Mat_Mul`'s
+  numpy / sympystr / octave printers emitted `A + B@x` instead of
+  `(A + B)@x`, so `Mat_Mul(A+B, x)` lambdified to a 2-D ndarray and
+  failed `Array(..., dim=1)` validation in `create_instance()`.
+  Each printer now wraps any non-`Symbol`/`Function` operand in
+  parentheses.
+
+- **Layer 2 classifier no longer conflates structurally distinct
+  fallback shapes.** The previous classifier short-circuited on any
+  `Diag`-bearing term and unconditionally emitted `"multiple Diag
+  nodes"`, misdiagnosing single-`Diag` and element-wise `Mul` cases.
+  The new classifier dispatches on the post-sign-extraction core and
+  produces distinct messages for biscale, single-`Diag`, no-`Diag`
+  `Mat_Mul`, element-wise `Mul`, bare `Para`, and other shapes.
+
+- **Layer 1 `Add`+non-`Para` suggestion** previously contained literal
+  Python source (`' + '.join(f'Mat_Mul({arg}, <operand>)' for arg in
+  ...)`) instead of a usable distributed-form rewrite.
+
+### How to silence
+
+```python
+import warnings
+warnings.simplefilter('ignore', UserWarning)
+```
+
 ## 0.8.5
 
 LoopEqn prototype close-out: new `Set` primitive for subset

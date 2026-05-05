@@ -70,7 +70,8 @@ class MutableMatBlockMapping:
 
     __slots__ = ('n_out', 'diag_terms', 'row_scale_terms',
                  'col_scale_terms', 'biscale_terms', 'fallback_expr',
-                 'fallback_out_row', 'fallback_out_col', 'has_fallback')
+                 'fallback_out_row', 'fallback_out_col', 'has_fallback',
+                 'fallback_pieces')
 
     def __init__(self, n_out: int):
         self.n_out = n_out
@@ -86,6 +87,7 @@ class MutableMatBlockMapping:
         self.fallback_out_row: Optional[np.ndarray] = None
         self.fallback_out_col: Optional[np.ndarray] = None
         self.has_fallback: bool = False
+        self.fallback_pieces: List[Expr] = []
 
 
 def _extract_sign_and_core(term: Expr) -> Tuple[float, Expr]:
@@ -520,6 +522,7 @@ def analyze_mutable_mat_expr(expr: Expr,
         mapping.fallback_out_row = np.asarray(value0_row, dtype=np.int64)
         mapping.fallback_out_col = np.asarray(value0_col, dtype=np.int64)
         mapping.has_fallback = True
+        mapping.fallback_pieces = fallback_pieces
 
     return mapping
 

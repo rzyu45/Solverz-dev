@@ -842,6 +842,58 @@ small; for models with many blocks per variable (such as power flow,
 with distinct $\partial/\partial e$ and $\partial/\partial f$ blocks
 for both $P$ and $Q$ balances) the advantage compounds.
 
+(diagnostic-warnings)=
+## Diagnostic warnings
+
+When a `Mat_Mul` placeholder or a mutable Jacobian block cannot use the
+fast path, Solverz emits a `UserWarning` describing *what* broke the fast
+path, *why*, and *how to rewrite* the expression to recover it. Warnings
+fire once per fallback item during code generation (module mode only —
+the inline printer has no fast/fallback split).
+
+All warnings use the standard Python `warnings.warn(..., UserWarning)`
+mechanism. To silence them:
+
+```python
+import warnings
+warnings.simplefilter('ignore', UserWarning)
+```
+
+### Layer 1 — `Mat_Mul` placeholder fallback
+
+| Expression | Reason | Suggested rewrite |
+|---|---|---|
+| `Mat_Mul(-A, x)` | Negation of a sparse Param | `-Mat_Mul(A, x)` — move negation outside |
+| `Mat_Mul(c*A, x)` | Scalar multiple of a Param (numeric or scalar `Param`) | `c * Mat_Mul(A, x)` — move scalar outside |
+| `Mat_Mul(transpose(A), x)` | Transposed matrix Param | Predeclare `A_T = Param('A_T', value=A.T, dim=2, sparse=True)` and write `Mat_Mul(A_T, x)` |
+| `Mat_Mul(A*B, x)` | Element-wise `Mul` of two matrix Params (`*`, not `Mat_Mul`) | Nest as `Mat_Mul(A, Mat_Mul(B, x))`, or distribute |
+| `Mat_Mul(A+B, x)` | Sum of matrices | `Mat_Mul(A, x) + Mat_Mul(B, x)` — distribute |
+| `Mat_Mul(A, B, x)` | Multi-arg `Mat_Mul` leaves inner product in operand | `Mat_Mul(A, Mat_Mul(B, x))` — nest explicitly |
+| `Mat_Mul(A, f(B, x))` | Operand references sparse `dim=2` `Param` | Precompute the lookup as a `dim=1` vector `Param` |
+| `Mat_Mul(A, x)` with dense `A` | Dense `dim=2` `Param` (from `_warn_dense_matmul_params` at `FormJac` time) | Declare with `sparse=True` |
+| Demotion cascade | Upstream fallback placeholder references this one | Fix the upstream fallback first; demoted placeholders auto-recover |
+
+### Layer 2 — Mutable Jacobian block fallback
+
+When a mutable Jacobian block contains a term that doesn't match the
+`Diag` / row-scale / col-scale / biscale fast path, the warning names
+the equation, variable, and the offending term.
+
+Common causes (the L2 classifier reports each one distinctly):
+- **Element-wise `Mul` with `Diag` factors** — e.g.
+  `Diag(u) * M * Diag(v)` written with Python `*`. Rewrite as
+  `Mat_Mul(Diag(u), M, Diag(v))`.
+- **Single-Diag `Mat_Mul` with an unsupported matrix factor** —
+  `Mat_Mul(Diag(v), A+B)` or similar where the analyzer's
+  `_sparse_matrix_nnz` can't materialise the matrix factor. Split the
+  term so each piece has a single sparse `dim=2` Param.
+- **Biscale `Mat_Mul(Diag(u), M, Diag(v))` with unsupported middle
+  matrix `M`**.
+- **No-`Diag` `Mat_Mul` of two matrices** — wrap one operand in
+  `Diag(...)` or split into supported shapes.
+- **Two-argument `Mat_Mul(Diag(u), Diag(v))`** — degenerate; rewrite
+  as `Diag(u * v)`.
+
 (restrictions)=
 ## Restrictions and reserved names
 
