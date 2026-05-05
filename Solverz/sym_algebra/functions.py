@@ -87,33 +87,34 @@ class Mat_Mul(MatrixFunction):
         else:
             return _latex_str
 
+    @staticmethod
+    def _operand_str(arg, printer):
+        # Wrap any non-atomic operand (``Add``, ``Mul``, etc.) in parens so
+        # ``Mat_Mul(A+B, x)`` lowers to ``(A+B)@x`` rather than ``A+B@x`` —
+        # without these parens, ``@`` would bind tighter than ``+`` and the
+        # generated code computes ``A + (B@x)``.
+        s = printer._print(arg)
+        return s if isinstance(arg, (Symbol, Function)) else '(' + s + ')'
+
     def _sympystr(self, printer, **kwargs):
-        temp = printer._print(self.args[0])
+        temp = self._operand_str(self.args[0], printer)
         for arg in self.args[1:]:
-            if isinstance(arg, (Symbol, Function)):
-                temp += '@{operand}'.format(operand=printer._print(arg))
-            else:
-                temp += '@({operand})'.format(operand=printer._print(arg))
+            temp += '@' + self._operand_str(arg, printer)
         return temp
 
     def _numpycode(self, printer, **kwargs):
-
-        temp = printer._print(self.args[0])
+        temp = self._operand_str(self.args[0], printer)
         for arg in self.args[1:]:
-            if isinstance(arg, (Symbol, Function)):
-                temp += '@{operand}'.format(operand=printer._print(arg))
-            else:
-                temp += '@({operand})'.format(operand=printer._print(arg))
+            temp += '@' + self._operand_str(arg, printer)
         return r'(' + temp + r')'
 
     def _octave(self, printer, **kwargs):
-
-        temp = printer._print(self.args[0])
+        def _oct_op(arg):
+            s = printer._print(arg)
+            return s if isinstance(arg, (Symbol, Function)) else '(' + s + ')'
+        temp = _oct_op(self.args[0])
         for arg in self.args[1:]:
-            if isinstance(arg, (Symbol, Function)):
-                temp += '*{operand}'.format(operand=printer._print(arg))
-            else:
-                temp += '*({operand})'.format(operand=printer._print(arg))
+            temp += '*' + _oct_op(arg)
         return r'(' + temp + r')'
 
     def _lambdacode(self, printer, **kwargs):
