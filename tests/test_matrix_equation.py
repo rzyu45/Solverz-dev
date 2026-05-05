@@ -763,3 +763,591 @@ def test_matmul_negation_warns_with_rewrite_suggestion():
         f'negation, got: {msg}')
     assert '-Mat_Mul' in msg or 'outside' in msg.lower(), (
         f'warning should suggest moving the negation outside, got: {msg}')
+
+
+def test_matmul_sum_warns_with_distribute_suggestion():
+    """``Mat_Mul(A+B, x)`` falls back because ``A+B`` is not a bare
+    sparse Param. End-to-end test: drives ``print_F`` and asserts the
+    resulting ``UserWarning`` names the placeholder, identifies the sum,
+    and suggests distributing the product.
+    """
+    from Solverz.code_printer.python.module.module_printer import (
+        print_F, print_sub_inner_F)
+
+    m = Model()
+    m.x = Var('x', [0.5, 0.5])
+    m.b = Param('b', [3.0, 4.0])
+    m.A = Param('A', [[1.0, 0.5], [0.5, 1.0]], dim=2, sparse=True)
+    m.B = Param('B', [[0.5, 0.0], [0.0, 0.5]], dim=2, sparse=True)
+    m.eqn = Eqn('f', Mat_Mul(m.A + m.B, m.x) - m.b)
+
+    spf, y0 = m.create_instance()
+    spf.FormJac(y0)
+    _, precompute_info = print_sub_inner_F(spf.EQNs)
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        print_F('AE', spf.var_address, spf.PARAM, nstep=0,
+                precompute_info=precompute_info)
+
+    fb = [x for x in w
+          if issubclass(x.category, UserWarning)
+          and 'Mat_Mul placeholder' in str(x.message)
+          and 'falls back' in str(x.message)]
+    assert len(fb) >= 1, (
+        f'expected a Mat_Mul fallback warning, captured: '
+        f'{[str(x.message) for x in w]}')
+    msg = str(fb[0].message)
+    assert '_sz_mm_' in msg, \
+        f'warning should name the placeholder, got: {msg}'
+    assert 'sum' in msg.lower(), \
+        f'warning should mention "sum", got: {msg}'
+    assert 'A' in msg and 'B' in msg, \
+        f'warning should name both matrices, got: {msg}'
+    assert 'distribute' in msg.lower(), \
+        f'warning should suggest distribution, got: {msg}'
+    assert 'Mat_Mul(A' in msg and 'Mat_Mul(B' in msg, \
+        f'suggestion should show both distributed Mat_Muls, got: {msg}'
+
+
+def test_matmul_scalar_mul_warns_with_factor_suggestion():
+    """``Mat_Mul(2*A, x)`` falls back because ``2*A`` is not a bare
+    sparse Param. The Layer 1 classifier must emit a UserWarning that:
+
+    1. Names the placeholder.
+    2. Identifies the scalar coefficient.
+    3. Suggests factoring: ``2 * Mat_Mul(A, x)``.
+    """
+    from Solverz.code_printer.python.module.module_printer import (
+        print_F, print_sub_inner_F)
+
+    m = Model()
+    m.x = Var('x', [0.0, 0.0])
+    m.b = Param('b', [1.0, 2.0])
+    m.A = Param('A', [[1.0, 0.5], [0.5, 1.0]], dim=2, sparse=True)
+    m.eqn = Eqn('f', Mat_Mul(2 * m.A, m.x) - m.b)
+
+    spf, y0 = m.create_instance()
+    spf.FormJac(y0)
+    _, precompute_info = print_sub_inner_F(spf.EQNs)
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        print_F('AE', spf.var_address, spf.PARAM, nstep=0,
+                precompute_info=precompute_info)
+
+    fb = [x for x in w
+          if issubclass(x.category, UserWarning)
+          and 'Mat_Mul placeholder' in str(x.message)
+          and 'falls back' in str(x.message)]
+    assert len(fb) >= 1, (
+        f'expected a Mat_Mul fallback warning, captured: '
+        f'{[str(x.message) for x in w]}')
+    msg = str(fb[0].message)
+    assert '_sz_mm_' in msg, \
+        f'warning should name the placeholder, got: {msg}'
+    assert ('scalar' in msg.lower()
+            or 'coefficient' in msg.lower()
+            or 'factor' in msg.lower()), (
+        f'warning should mention scalar/factor, got: {msg}')
+    assert 'outside' in msg.lower() or 'c *' in msg or '2 *' in msg, (
+        f'warning should suggest moving scalar outside, got: {msg}')
+
+
+def test_matmul_three_arg_operand_warns_with_nesting_suggestion():
+    """``Mat_Mul(A, B, x)`` falls back because the operand contains an
+    unresolved ``Mat_Mul`` (R3 multi-arg fold). The Layer 1 classifier
+    must emit a UserWarning that:
+
+    1. Names the placeholder.
+    2. Identifies that the operand contains Mat_Mul.
+    3. Suggests explicit two-level nesting:
+       ``Mat_Mul(A, Mat_Mul(B, x))``.
+    """
+    from Solverz.code_printer.python.module.module_printer import (
+        print_F, print_sub_inner_F)
+
+    m = Model()
+    m.x = Var('x', [0.5, 0.5])
+    m.b = Param('b', [3.0, 4.0])
+    m.A = Param('A', [[1.0, 0.5], [0.5, 1.0]], dim=2, sparse=True)
+    m.B = Param('B', [[2.0, 0.0], [0.0, 2.0]], dim=2, sparse=True)
+    m.eqn = Eqn('f', Mat_Mul(m.A, m.B, m.x) - m.b)
+
+    spf, y0 = m.create_instance()
+    spf.FormJac(y0)
+    _, precompute_info = print_sub_inner_F(spf.EQNs)
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        print_F('AE', spf.var_address, spf.PARAM, nstep=0,
+                precompute_info=precompute_info)
+
+    fb = [x for x in w
+          if issubclass(x.category, UserWarning)
+          and 'Mat_Mul placeholder' in str(x.message)
+          and 'falls back' in str(x.message)]
+    assert len(fb) >= 1, (
+        f'expected a Mat_Mul fallback warning, captured: '
+        f'{[str(x.message) for x in w]}')
+    msg = str(fb[0].message)
+    assert '_sz_mm_' in msg, \
+        f'warning should name the placeholder, got: {msg}'
+    assert ('nested' in msg.lower()
+            or ('Mat_Mul' in msg and 'operand' in msg.lower()
+                and 'nest' in msg.lower())), (
+        f'warning should identify Mat_Mul in operand and suggest nesting, '
+        f'got: {msg}')
+
+
+def test_matmul_sparse_para_in_operand_warns_with_precompute_suggestion():
+    """``Mat_Mul(A, f(B, x))`` where ``B`` is a sparse ``dim=2`` Param
+    falls back because sparse ``dim=2`` symbols are not available by
+    name inside ``inner_F`` (only their CSC flat fields are). The Layer 1
+    classifier must return a precompute suggestion *and* the emission
+    path must produce a ``UserWarning`` carrying that suggestion.
+
+    No equation hits this case naturally (a sparse ``dim=2`` Param can
+    only enter the operand of a ``Mat_Mul`` placeholder by way of
+    another ``Mat_Mul``, which is the R3 case). So this test exercises
+    the classifier and the emission entry point directly with a
+    synthesised ``(name, mat, op)`` triple — the same triple shape
+    ``_classify_matmul_placeholders`` would feed in production.
+    """
+    from Solverz.code_printer.python.module.module_printer import (
+        _classify_l1_fallback_reason, _emit_l1_fallback_warnings)
+    from Solverz.sym_algebra.symbols import iVar
+
+    m = Model()
+    m.A = Param('A', [[1.0, 0.5], [0.5, 1.0]], dim=2, sparse=True)
+    m.B = Param('B', [[2.0, 0.0], [0.0, 2.0]], dim=2, sparse=True)
+    op = iVar('x') * m.B
+    spf, y0 = m.create_instance()
+    PARAM = spf.PARAM
+
+    reason, expr_str, suggestion = _classify_l1_fallback_reason(m.A, op, PARAM)
+    assert 'references' in reason.lower() and 'sparse' in reason.lower(), (
+        f'reason should mention operand references a sparse Param, '
+        f'got: {reason}')
+    assert 'B' in reason, \
+        f'reason should name the offending Param B, got: {reason}'
+    assert ('precompute' in suggestion.lower()
+            or 'vector' in suggestion.lower()), (
+        f'suggestion should recommend precomputing as a vector, '
+        f'got: {suggestion}')
+
+    # Verify the emission path wraps the classifier output into a
+    # ``UserWarning`` with the placeholder name and full message body.
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        _emit_l1_fallback_warnings(
+            [('_sz_mm_test', m.A, op)],
+            fast_candidates=set(),
+            PARAM=PARAM,
+        )
+    fb = [x for x in w
+          if issubclass(x.category, UserWarning)
+          and 'Mat_Mul placeholder' in str(x.message)]
+    assert len(fb) == 1, (
+        f'expected exactly one Mat_Mul fallback warning, captured: '
+        f'{[str(x.message) for x in w]}')
+    msg = str(fb[0].message)
+    assert "'_sz_mm_test'" in msg, \
+        f'warning should name the placeholder, got: {msg}'
+    assert 'precompute' in msg.lower() or 'vector' in msg.lower(), \
+        f'warning should carry the precompute suggestion, got: {msg}'
+
+
+def test_matmul_nested_demotion_warns_with_root_cause():
+    """``Mat_Mul(-A, Mat_Mul(B, x))`` — the outer placeholder
+    ``_sz_mm_0 = Mat_Mul(-A, _sz_mm_1)`` falls back (negation), and
+    the inner ``_sz_mm_1 = Mat_Mul(B, x)`` is demoted because the
+    outer fallback consumes it. The warning for the demoted inner
+    placeholder must:
+
+    1. Name which upstream placeholder caused the demotion.
+    2. Explain the dependency chain.
+    """
+    from Solverz.code_printer.python.module.module_printer import (
+        print_F, print_sub_inner_F)
+
+    m = Model()
+    m.x = Var('x', [0.5, 0.5])
+    m.b = Param('b', [3.0, 4.0])
+    m.A = Param('A', [[1.0, 0.5], [0.5, 1.0]], dim=2, sparse=True)
+    m.B = Param('B', [[2.0, 0.0], [0.0, 2.0]], dim=2, sparse=True)
+    m.eqn = Eqn('f', Mat_Mul(-m.A, Mat_Mul(m.B, m.x)) - m.b)
+
+    spf, y0 = m.create_instance()
+    spf.FormJac(y0)
+    _, precompute_info = print_sub_inner_F(spf.EQNs)
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        print_F('AE', spf.var_address, spf.PARAM, nstep=0,
+                precompute_info=precompute_info)
+
+    fb = [x for x in w
+          if issubclass(x.category, UserWarning)
+          and 'Mat_Mul placeholder' in str(x.message)]
+    assert len(fb) >= 2, (
+        f'expected warnings for both outer fallback and demoted inner, '
+        f'captured: {[str(x.message) for x in w]}')
+    # Find the demotion warning — it should mention "demoted" and the
+    # upstream placeholder that caused the demotion.
+    demoted = [x for x in fb if 'demoted' in str(x.message).lower()]
+    assert len(demoted) >= 1, (
+        f'expected at least one demotion warning, '
+        f'captured fallback warnings: {[str(x.message) for x in fb]}')
+    assert '_sz_mm_' in str(demoted[0].message), (
+        f'demotion warning should name placeholders, '
+        f'got: {demoted[0].message}')
+    # Verify the demoted placeholder name and upstream both appear.
+    msg = str(demoted[0].message)
+    assert 'consumes' in msg.lower() or 'references' in msg.lower() or 'depend' in msg.lower(), (
+        f'demotion warning should explain the dependency, got: {msg}')
+
+
+# --- Layer 2 (mutable Jacobian fallback) diagnostic warnings ---
+
+
+def test_mutable_jac_fallback_warns_with_eqn_var_context():
+    """When a mutable Jacobian block contains a term that doesn't match
+    any supported fast-path shape (Diag / row-scale / col-scale /
+    biscale), the module printer must emit a UserWarning per fallback
+    piece that:
+
+    1. Names the equation and variable.
+    2. Prints the term that broke the fast path.
+    3. Identifies the specific structural mismatch (here: element-wise
+       ``Mul`` with ``Diag`` factors, not a matrix-product).
+    4. Suggests rewriting as ``Mat_Mul``.
+
+    Uses ``Diag(x) * A * Diag(y)`` (a raw ``Mul``, not wrapped in
+    ``Mat_Mul``) as the trigger — it doesn't match any fast-path shape
+    and falls through to ``fallback_pieces``.
+    """
+    from Solverz.code_printer.python.module.module_printer import (
+        _emit_l2_fallback_warnings)
+    from Solverz.sym_algebra.functions import Diag
+
+    A = Param('A', np.array([[2.0, 1.0], [1.0, 3.0]]), dim=2, sparse=True)
+    x = Param('x', [0.5, 0.5])
+    y = Param('y', [0.3, 0.7])
+    term = Diag(x) * A * Diag(y)
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        _emit_l2_fallback_warnings('f', 'x', [term])
+
+    l2 = [m for m in w
+          if issubclass(m.category, UserWarning)
+          and 'Mutable Jacobian block' in str(m.message)]
+    assert len(l2) >= 1, (
+        f'expected a Layer 2 Jacobian fallback warning, '
+        f'captured: {[str(m.message) for m in w]}')
+    msg = str(l2[0].message)
+    assert 'eqn' in msg.lower() and "'f'" in msg, (
+        f'L2 warning should name the equation, got: {msg}')
+    assert 'var' in msg.lower() and "'x'" in msg, (
+        f'L2 warning should name the variable, got: {msg}')
+    assert 'element-wise' in msg.lower() or "mul" in msg.lower(), (
+        f'L2 warning should diagnose the element-wise Mul mistake, '
+        f'got: {msg}')
+    assert 'mat_mul' in msg.lower(), (
+        f'L2 warning should suggest rewriting as Mat_Mul, got: {msg}')
+
+
+def test_mutable_jac_l2_classifier_distinguishes_shapes():
+    """The Layer 2 classifier must produce *different* diagnostic text
+    for structurally different fallback shapes — biscale/single-Diag/
+    no-Diag Mat_Mul should not all degrade to the same message.
+
+    Regression guard for the previous classifier, which fell through
+    to "multiple Diag nodes" for any term containing ``Diag``,
+    misdiagnosing single-Diag and bare-matrix cases.
+    """
+    from Solverz.code_printer.python.module.module_printer import (
+        _classify_l2_fallback_reason)
+    from Solverz.sym_algebra.functions import Diag
+    from Solverz.sym_algebra.symbols import iVar
+
+    A = Param('A', np.array([[2.0, 1.0], [1.0, 3.0]]), dim=2, sparse=True)
+    B = Param('B', np.array([[1.0, 0.0], [0.0, 1.0]]), dim=2, sparse=True)
+    u = iVar('u')
+    v = iVar('v')
+
+    # 1) Mat_Mul of two matrices, no Diag at either end.
+    no_diag_term = Mat_Mul(A, B)
+    r_no_diag, s_no_diag = _classify_l2_fallback_reason(no_diag_term)
+    assert 'without' in r_no_diag.lower() and 'diag' in r_no_diag.lower(), (
+        f'no-Diag case should flag missing Diag wrapper, got: {r_no_diag}')
+    assert 'wrap' in s_no_diag.lower() or 'split' in s_no_diag.lower(), (
+        f'no-Diag suggestion should propose wrapping or splitting, '
+        f'got: {s_no_diag}')
+
+    # 2) Single-Diag Mat_Mul where the matrix factor is a sum (the
+    # analyzer rejects ``A + B`` as a constant sparse matrix).
+    single_diag_term = Mat_Mul(Diag(u), A + B)
+    r_single, s_single = _classify_l2_fallback_reason(single_diag_term)
+    assert ('single-diag' in r_single.lower()
+            or "diag(v) @ m" in r_single.lower()
+            or "m @ diag(v)" in r_single.lower()), (
+        f'single-Diag case should be identified explicitly, got: {r_single}')
+
+    # 3) Biscale shape but the middle is non-materialisable.
+    biscale_term = Mat_Mul(Diag(u), A + B, Diag(v))
+    r_bi, s_bi = _classify_l2_fallback_reason(biscale_term)
+    assert 'biscale' in r_bi.lower(), (
+        f'biscale case should be identified explicitly, got: {r_bi}')
+
+    # 4) Bare ``Para`` — no Diag, no Mat_Mul. Extract the Para symbol
+    # from a Mat_Mul (the analyzer's Param→Para conversion is what the
+    # classifier actually sees in production).
+    A_para = Mat_Mul(A, iVar('z')).args[0]
+    r_bare, s_bare = _classify_l2_fallback_reason(A_para)
+    assert 'bare' in r_bare.lower() and 'param' in r_bare.lower(), (
+        f'bare Para case should be identified explicitly, got: {r_bare}')
+
+    # 5) Two-argument ``Mat_Mul(Diag(u), Diag(v))`` — degenerate biscale.
+    # Should NOT report "biscale shape Diag(u) @ M @ Diag(v) where M ..."
+    # because there is no middle factor M.
+    diag_diag_term = Mat_Mul(Diag(u), Diag(v))
+    r_dd, s_dd = _classify_l2_fallback_reason(diag_diag_term)
+    assert 'two' in r_dd.lower() or 'no middle' in r_dd.lower(), (
+        f'2-arg Mat_Mul(Diag, Diag) should NOT be reported as a "biscale '
+        f"with bad middle M\" (there is no middle), got: {r_dd}")
+    assert 'diag(u * v)' in s_dd.lower() or 'compose' in s_dd.lower(), (
+        f"suggestion should propose Diag(u*v), got: {s_dd}")
+
+    # All five reasons should be pairwise distinct — this is the
+    # regression guard.
+    reasons = {r_no_diag, r_single, r_bi, r_bare, r_dd}
+    assert len(reasons) == 5, (
+        f'each fallback shape should produce a distinct reason, '
+        f'got: {reasons}')
+
+
+def test_matmul_transpose_warns_with_predeclare_suggestion():
+    """``Mat_Mul(transpose(A), x)`` falls back because the @njit fast
+    path reads A's CSC flat fields directly and can't transpose at
+    runtime. The Layer 1 classifier must surface this and suggest
+    predeclaring ``A_T`` as a separate sparse Param.
+
+    Drives the classifier directly because ``transpose`` doesn't yet
+    have a Python printer (``PrintMethodNotImplementedError`` from
+    ``PythonCodePrinter``) so end-to-end ``render_modules`` can't
+    materialise the equation.
+    """
+    from Solverz.code_printer.python.module.module_printer import (
+        _classify_l1_fallback_reason)
+    from Solverz.sym_algebra.functions import transpose
+    from Solverz.sym_algebra.symbols import iVar
+
+    m = Model()
+    m.A = Param('A', [[1.0, 0.5], [0.5, 1.0]], dim=2, sparse=True)
+    spf, y0 = m.create_instance()
+    PARAM = spf.PARAM
+
+    mat = transpose(m.A)
+    op = iVar('x')
+    reason, expr_str, suggestion = _classify_l1_fallback_reason(
+        mat, op, PARAM)
+    assert 'transpose' in reason.lower(), (
+        f'reason should mention transpose, got: {reason}')
+    assert 'A' in expr_str, (
+        f'expression should reference matrix A, got: {expr_str}')
+    assert ('predeclare' in suggestion.lower()
+            or 'A_T' in suggestion), (
+        f'suggestion should propose predeclaring A.T as a separate '
+        f'Param, got: {suggestion}')
+
+
+def test_matmul_scalar_param_coeff_warns_with_factor_suggestion():
+    """``Mat_Mul(c*A, x)`` where ``c`` is a *Solverz scalar Param* (not
+    a numeric literal) must hit the scalar-mul branch, not fall through
+    to the generic message.
+
+    Regression guard for codex review finding: the previous classifier
+    only matched ``isinstance(a, Number)`` for the coefficient, so
+    ``Param('c', 2.0) * A`` silently degraded to "matrix operand is not
+    a bare sparse Param" with no actionable suggestion.
+    """
+    from Solverz.code_printer.python.module.module_printer import (
+        print_F, print_sub_inner_F)
+
+    m = Model()
+    m.x = Var('x', [0.0, 0.0])
+    m.b = Param('b', [1.0, 2.0])
+    m.c = Param('c', 2.0)
+    m.A = Param('A', [[1.0, 0.5], [0.5, 1.0]], dim=2, sparse=True)
+    m.eqn = Eqn('f', Mat_Mul(m.c * m.A, m.x) - m.b)
+
+    spf, y0 = m.create_instance()
+    spf.FormJac(y0)
+    _, precompute_info = print_sub_inner_F(spf.EQNs)
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        print_F('AE', spf.var_address, spf.PARAM, nstep=0,
+                precompute_info=precompute_info)
+
+    fb = [x for x in w
+          if issubclass(x.category, UserWarning)
+          and 'Mat_Mul placeholder' in str(x.message)
+          and 'falls back' in str(x.message)]
+    assert len(fb) >= 1, (
+        f'expected a Mat_Mul fallback warning, captured: '
+        f'{[str(x.message) for x in w]}')
+    msg = str(fb[0].message)
+    assert ('scalar' in msg.lower() and 'multiple' in msg.lower()), (
+        f'warning should diagnose scalar*matrix shape, got: {msg}')
+    assert 'A' in msg and 'c' in msg, (
+        f'warning should name both factors, got: {msg}')
+    assert 'factor' in msg.lower() and 'outside' in msg.lower(), (
+        f'warning should suggest factoring scalar outside Mat_Mul, '
+        f'got: {msg}')
+
+
+def test_matmul_elementwise_matrix_product_warns_with_nesting_suggestion():
+    """``Mat_Mul(A*B, x)`` uses Python ``*`` (element-wise) between two
+    sparse matrix Params instead of ``Mat_Mul`` (matrix product). The
+    Layer 1 classifier must distinguish this from "scalar * matrix" and
+    suggest either nesting Mat_Muls or distributing.
+
+    Verifies stacklevel points at user code: the warning's filename
+    should NOT be inside ``Solverz/code_printer/`` (which would mean
+    stacklevel was off and the warning is blaming library internals).
+    """
+    import tempfile
+    from Solverz.code_printer.python.module.module_generator import (
+        render_modules)
+
+    m = Model()
+    m.x = Var('x', [0.5, 0.5])
+    m.b = Param('b', [3.0, 4.0])
+    m.A = Param('A', [[2.0, 1.0], [1.0, 3.0]], dim=2, sparse=True)
+    m.B = Param('B', [[1.0, 0.0], [0.0, 1.0]], dim=2, sparse=True)
+    m.eqn = Eqn('f', Mat_Mul(m.A * m.B, m.x) - m.b)
+    spf, y0 = m.create_instance()
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        with tempfile.TemporaryDirectory() as d:
+            render_modules(spf, y0, name='probe_em', directory=d)
+
+    fb = [x for x in w
+          if issubclass(x.category, UserWarning)
+          and 'Mat_Mul placeholder' in str(x.message)
+          and 'falls back' in str(x.message)]
+    assert len(fb) >= 1, (
+        f'expected a Mat_Mul fallback warning, captured: '
+        f'{[str(x.message) for x in w]}')
+    msg = str(fb[0].message)
+    assert 'element-wise' in msg.lower(), (
+        f'warning should diagnose element-wise Mul, got: {msg}')
+    assert 'A * B' in msg, (
+        f'warning should show the element-wise product, got: {msg}')
+    # stacklevel guard: the warning's reported filename must NOT be
+    # inside the code_printer subtree (which would mean stacklevel was
+    # too small and the warning blamed library internals).
+    assert 'code_printer' not in fb[0].filename, (
+        f'stacklevel should point at user code, not at '
+        f'Solverz/code_printer/. Got: {fb[0].filename}')
+
+
+def test_mutable_jac_l2_fallback_via_analyzer_integration():
+    """End-to-end coverage of the Layer 2 pipeline:
+
+    1. ``analyze_mutable_mat_expr`` correctly identifies a
+       fallback-shape term and surfaces it via
+       ``mapping.has_fallback`` / ``mapping.fallback_pieces``.
+    2. The same fallback pieces feed cleanly into
+       ``_emit_l2_fallback_warnings``, producing a UserWarning with
+       the L2 classifier's structural diagnosis.
+
+    Together these two assertions guarantee the analyzer→emitter
+    contract holds. The only remaining integration step is the 3-line
+    ``if mapping.has_fallback: emit(...)`` glue inside
+    ``print_inner_J`` (line 350-353).
+    """
+    from Solverz.code_printer.python.module.module_printer import (
+        _emit_l2_fallback_warnings)
+    from Solverz.code_printer.python.module.mutable_mat_analyzer import (
+        analyze_mutable_mat_expr)
+    from Solverz.sym_algebra.functions import Diag
+    from Solverz.sym_algebra.symbols import iVar
+
+    # Build a real PARAM dict via create_instance() so the analyzer
+    # has a registered ``A`` to inspect.
+    m = Model()
+    m.A = Param('A', np.array([[2.0, 1.0], [1.0, 3.0]]),
+                dim=2, sparse=True)
+    spf, _ = m.create_instance()
+    PARAM = spf.PARAM
+
+    # Element-wise Mul of Diag(u) * A * Diag(v) — falls through
+    # ``handle()`` to ``fallback_pieces`` because it isn't Mat_Mul.
+    u = iVar('u')
+    v = iVar('v')
+    expr = Diag(u) * m.A * Diag(v)
+
+    # Stage 1: analyzer correctly classifies as fallback.
+    row = np.array([0, 1])
+    col = np.array([0, 1])
+    mapping = analyze_mutable_mat_expr(expr, row, col, PARAM, eqn_size=2)
+    assert mapping.has_fallback, (
+        'analyzer must mark this expression as has_fallback=True')
+    assert len(mapping.fallback_pieces) == 1, (
+        f'expected exactly one fallback piece, got '
+        f'{mapping.fallback_pieces}')
+
+    # Stage 2: emitter formats the warning correctly from the
+    # analyzer's output.
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        _emit_l2_fallback_warnings('myeqn', 'myvar',
+                                   mapping.fallback_pieces)
+    l2 = [x for x in w
+          if issubclass(x.category, UserWarning)
+          and 'Mutable Jacobian block' in str(x.message)]
+    assert len(l2) == 1, (
+        f'expected exactly one L2 warning, captured: '
+        f'{[str(x.message) for x in w]}')
+    msg = str(l2[0].message)
+    assert "'myeqn'" in msg and "'myvar'" in msg, (
+        f'warning should name the equation and variable, got: {msg}')
+    assert 'element-wise' in msg.lower(), (
+        f'warning should diagnose element-wise Mul, got: {msg}')
+    assert 'Mat_Mul' in msg, (
+        f'warning should suggest rewriting as Mat_Mul, got: {msg}')
+
+
+def test_no_matmul_fallback_warnings_in_inline_mode():
+    """Layer 1 / Layer 2 fallback warnings fire only from the module
+    printer — inline mode (``made_numerical``) has no fast/fallback
+    split, so none of the ``Mat_Mul placeholder`` / ``Mutable Jacobian
+    block`` warnings should appear.
+
+    ``_warn_dense_matmul_params`` (from ``FormJac``) still fires in
+    both modes — that's expected and not filtered here.
+    """
+    m = Model()
+    m.x = Var('x', [0.5, 0.5])
+    m.b = Param('b', [3.0, 4.0])
+    m.A = Param('A', [[1.0, 0.5], [0.5, 1.0]], dim=2, sparse=True)
+    # Same model that triggers L1 warnings in module mode
+    m.eqn = Eqn('f', Mat_Mul(-m.A, m.x) - m.b)
+
+    spf, y0 = m.create_instance()
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        made_numerical(spf, y0, sparse=True)
+
+    l1_l2 = [x for x in w
+             if issubclass(x.category, UserWarning)
+             and ('Mat_Mul placeholder' in str(x.message)
+                  or 'Mutable Jacobian block' in str(x.message))]
+    assert len(l1_l2) == 0, (
+        f'L1/L2 fallback warnings must not fire in inline mode, '
+        f'captured: {[str(x.message) for x in l1_l2]}')

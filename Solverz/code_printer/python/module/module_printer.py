@@ -5,7 +5,8 @@ from typing import Any, Set, Tuple
 
 import numpy as np
 import sympy as sp
-from sympy import Function, IndexedBase, Mul, S
+from sympy import Add, Function, IndexedBase, Mul, Number, S
+from Solverz.sym_algebra.functions import transpose
 from Solverz.code_printer.python.utilities import *
 from Solverz.code_printer.python.module.mutable_mat_analyzer import (
     analyze_mutable_mat_expr,
@@ -347,6 +348,9 @@ def print_inner_J(var_addr: Address,
                     eqn_size = jb.EqnAddr.stop - jb.EqnAddr.start
                     mapping = analyze_mutable_mat_expr(
                         jb.SpDeriExpr, jb.CooRow, jb.CooCol, PARAM, eqn_size)
+                    if mapping.has_fallback:
+                        _emit_l2_fallback_warnings(
+                            eqn_name, var.name, mapping.fallback_pieces)
                     block_info = {
                         'addr_slice': addr_by_ele,
                         'expr': jb.SpDeriExpr,
@@ -573,7 +577,9 @@ def _classify_matmul_placeholders(precompute_info, PARAM, emit_warnings=False):
 
     # Pass 2 — demote fast candidates consumed by any non-fast
     # placeholder's matrix or operand. Repeat until fixed point so
-    # cascading dependencies propagate.
+    # cascading dependencies propagate. Track *which* upstream
+    # placeholder caused each demotion for root-cause traceback.
+    demotion_edges: Dict[str, str] = {}
     changed = True
     while changed:
         changed = False
@@ -588,6 +594,7 @@ def _classify_matmul_placeholders(precompute_info, PARAM, emit_warnings=False):
                     s_name = getattr(s, 'name', None)
                     if s_name and s_name in fast_candidates:
                         fast_candidates.discard(s_name)
+                        demotion_edges[s_name] = name  # demoted → consumer
                         changed = True
 
     # Build the output sets.
@@ -606,9 +613,26 @@ def _classify_matmul_placeholders(precompute_info, PARAM, emit_warnings=False):
                             fallback_symbols.add(s.name)
 
     if emit_warnings:
-        _emit_l1_fallback_warnings(all_triples, fast_candidates, PARAM)
+        _emit_l1_fallback_warnings(all_triples, fast_candidates, PARAM,
+                                   demotion_edges)
 
     return fast_info, fallback_names, fallback_symbols
+
+
+def _is_matrix_factor(arg, PARAM):
+    """Return ``True`` if ``arg`` is a matrix-valued symbolic operand —
+    a ``dim=2`` ``Para`` (sparse or dense) registered in ``PARAM``, or a
+    ``transpose(...)`` of one. Used to split the factors of a ``Mul``
+    into "scalar coefficients" and "matrix factors" without assuming the
+    coefficients are numeric (a Solverz ``Param('c', 2.0)`` scalar is
+    just as legitimate as a literal ``2``).
+    """
+    if isinstance(arg, Para):
+        p = PARAM.get(arg.name)
+        return p is not None and getattr(p, 'dim', 0) == 2
+    if isinstance(arg, transpose):
+        return any(_is_matrix_factor(a, PARAM) for a in arg.args)
+    return False
 
 
 def _classify_l1_fallback_reason(mat, op, PARAM):
@@ -620,27 +644,165 @@ def _classify_l1_fallback_reason(mat, op, PARAM):
     to format a multi-line ``UserWarning`` body. The classification is
     deliberately deterministic and shape-based — no symbolic
     rewriting — so users see the *exact* expression that broke the
-    fast path next to the suggested rewrite.
-    """
-    # Negation: Mat_Mul(-A, x) where A is a sparse dim=2 Para.
-    if isinstance(mat, Mul):
-        if len(mat.args) >= 2 and mat.args[0] == S.NegativeOne:
-            rest = mat.args[1:]
-            if len(rest) == 1 and isinstance(rest[0], Para):
-                inner = rest[0]
-                p = PARAM.get(inner.name)
-                if (p is not None
-                        and getattr(p, 'dim', 0) == 2
-                        and getattr(p, 'sparse', False)):
-                    return (
-                        f"matrix operand is `-{inner.name}` (negation of a "
-                        f"sparse Param), not a bare Param",
-                        f"-{inner.name}",
-                        f"-Mat_Mul({inner.name}, <operand>) — move the "
-                        f"negation outside Mat_Mul",
-                    )
+    fast path next to the suggested rewrite. Branches, in order:
 
-    # Generic fallback (not yet specialised — covered by later tests).
+    1. ``Mat_Mul(-A, x)`` — bare negation of a sparse Param.
+    2. ``Mat_Mul(transpose(A), x)`` — transposed matrix Param.
+    3. ``Mat_Mul(c*A, x)`` — single matrix factor with any (numeric or
+       symbolic) scalar coefficients, i.e. ``Mul`` with exactly one
+       matrix-valued factor.
+    4. ``Mat_Mul(A*B, x)`` — element-wise ``Mul`` of two or more
+       matrix-valued factors (operator mix-up: should be ``Mat_Mul``).
+    5. ``Mat_Mul(A, Mat_Mul(B, x))`` — operand contains an unresolved
+       ``Mat_Mul`` (R3 multi-arg fold).
+    6. ``Mat_Mul(A, f(B, x))`` — operand references a sparse ``dim=2``
+       Param other than through a ``Mat_Mul`` placeholder.
+    7. ``Mat_Mul(A+B, x)`` — matrix operand is a sum.
+    8. Anything else — generic fallback message.
+    """
+    # 1) Negation: Mat_Mul(-A, x) where A is a sparse dim=2 Para.
+    if (isinstance(mat, Mul)
+            and len(mat.args) >= 2
+            and mat.args[0] == S.NegativeOne):
+        rest = mat.args[1:]
+        if len(rest) == 1 and isinstance(rest[0], Para):
+            inner = rest[0]
+            p = PARAM.get(inner.name)
+            if (p is not None
+                    and getattr(p, 'dim', 0) == 2
+                    and getattr(p, 'sparse', False)):
+                return (
+                    f"matrix operand is `-{inner.name}` (negation of a "
+                    f"sparse Param), not a bare Param",
+                    f"-{inner.name}",
+                    f"-Mat_Mul({inner.name}, <operand>) — move the "
+                    f"negation outside Mat_Mul",
+                )
+
+    # 2) Transpose: Mat_Mul(transpose(A), x). The CSC flat fields of A
+    # don't transpose at runtime; the user must precompute A.T as its
+    # own sparse Param.
+    if isinstance(mat, transpose) and len(mat.args) == 1:
+        inner = mat.args[0]
+        if isinstance(inner, Para):
+            p = PARAM.get(inner.name)
+            if (p is not None
+                    and getattr(p, 'dim', 0) == 2):
+                return (
+                    f"matrix operand is `transpose({inner.name})` — the "
+                    f"@njit fast path can't transpose a sparse matrix at "
+                    f"runtime",
+                    f"transpose({inner.name})",
+                    f"predeclare ``{inner.name}_T = Param("
+                    f"'{inner.name}_T', value={inner.name}_value.T, "
+                    f"dim=2, sparse=True)`` and write "
+                    f"``Mat_Mul({inner.name}_T, <operand>)``",
+                )
+
+    # 3 + 4) Mat_Mul(c*A, x) and element-wise A*B mix-ups.
+    # Generalised so that any non-matrix factor (numeric Number, scalar
+    # Para, scalar iVar) counts as a "scalar coefficient" — the
+    # user-facing fix is identical: factor scalars outside ``Mat_Mul``.
+    if isinstance(mat, Mul):
+        matrix_factors = [a for a in mat.args if _is_matrix_factor(a, PARAM)]
+        scalar_factors = [a for a in mat.args if not _is_matrix_factor(a, PARAM)]
+        # Skip the bare negation already handled above.
+        already_negation = (
+            len(scalar_factors) == 1
+            and scalar_factors[0] == S.NegativeOne
+            and len(matrix_factors) == 1
+        )
+        if matrix_factors and not already_negation:
+            # 3) one matrix factor with any number of scalar factors.
+            if len(matrix_factors) == 1:
+                inner = matrix_factors[0]
+                inner_str = (inner.name if isinstance(inner, Para)
+                             else str(inner))
+                coeff = (Mul(*scalar_factors) if scalar_factors else S.One)
+                return (
+                    f"matrix operand is `({coeff})*{inner_str}` — a "
+                    f"scalar multiple of a matrix, not a bare Param",
+                    str(mat),
+                    f"({coeff}) * Mat_Mul({inner_str}, <operand>) — "
+                    f"factor the scalar coefficient outside ``Mat_Mul``",
+                )
+            # 4) two or more matrix factors → element-wise product.
+            names = ' * '.join(
+                a.name if isinstance(a, Para) else str(a)
+                for a in matrix_factors
+            )
+            return (
+                f"matrix operand is an element-wise ``Mul`` of "
+                f"{len(matrix_factors)} matrix factors ({names}) — "
+                f"Python ``*`` between matrices is element-wise, not "
+                f"matrix-product",
+                str(mat),
+                "rewrite the matrix product as nested ``Mat_Mul(A, "
+                "Mat_Mul(B, <operand>))``, or distribute to a sum of "
+                "single-matrix ``Mat_Mul`` calls",
+            )
+
+    # 5) R3 — operand contains unresolved Mat_Mul: Mat_Mul(A, B, x) where
+    # ``extract_matmuls`` folded the inner product into the operand and
+    # did not re-walk the fresh inner Mat_Mul(B, x).
+    # Must fire BEFORE operand_has_sparse_para: an operand like
+    # ``Mat_Mul(B, x)`` also contains sparse Para ``B`` in its
+    # free_symbols, but the nesting suggestion is more specific.
+    if hasattr(op, 'has') and op.has(Mat_Mul):
+        return (
+            "operand contains an unresolved ``Mat_Mul`` — "
+            "``extract_matmuls`` folded a multi-argument ``Mat_Mul`` "
+            "and left the inner product in the operand",
+            str(op),
+            "nest explicitly: ``Mat_Mul(A, Mat_Mul(B, x))`` so the "
+            "inner ``Mat_Mul`` is walked to its own placeholder",
+        )
+
+    # 6) operand references a sparse dim=2 Para — not available by name
+    # inside ``inner_F`` (only its CSC flat fields are).
+    if hasattr(op, 'free_symbols'):
+        sparse_paras = set()
+        for s in op.free_symbols:
+            if isinstance(s, Para) and s.name in PARAM:
+                p_op = PARAM[s.name]
+                if (getattr(p_op, 'dim', 0) == 2
+                        and getattr(p_op, 'sparse', False)):
+                    sparse_paras.add(s.name)
+        if sparse_paras:
+            names = ', '.join(sorted(sparse_paras))
+            return (
+                f"operand references sparse ``dim=2`` Param(s): {names} — "
+                f"not available by name inside ``inner_F``",
+                str(op),
+                f"precompute the lookup as a ``dim=1`` vector Param "
+                f"before passing into ``Mat_Mul``",
+            )
+
+    # 7) Sum: Mat_Mul(A+B, x).
+    if isinstance(mat, Add):
+        arg_strs = [
+            arg.name if isinstance(arg, Para) else str(arg)
+            for arg in mat.args
+        ]
+        distributed = ' + '.join(
+            f'Mat_Mul({s}, <operand>)' for s in arg_strs
+        )
+        all_para = all(isinstance(a, Para) for a in mat.args)
+        if all_para:
+            return (
+                f"matrix operand is a sum of {len(mat.args)} matrices "
+                f"({' + '.join(arg_strs)}), not a bare Param",
+                str(mat),
+                f"distribute: {distributed}",
+            )
+        return (
+            f"matrix operand is a sum of {len(mat.args)} terms, "
+            f"not a bare sparse ``dim=2`` Param",
+            str(mat),
+            f"distribute Mat_Mul over the sum: {distributed}",
+        )
+
+    # 8) Generic fallback.
     return (
         "matrix operand is not a bare sparse `dim=2` Param",
         str(mat),
@@ -649,7 +811,34 @@ def _classify_l1_fallback_reason(mat, op, PARAM):
     )
 
 
-def _emit_l1_fallback_warnings(all_triples, fast_candidates, PARAM):
+def _format_fallback_warning(header, body):
+    """Format a multi-line fallback warning body. ``header`` is the
+    one-line summary (placeholder name / Jac-block context). ``body``
+    is a list of ``(label, value)`` tuples — typically Reason /
+    Expression-or-Term / Suggested rewrite.
+
+    Centralising the formatting keeps L1 and L2 warnings visually
+    aligned and gives the test suite a single thing to assert against
+    if the warning template changes.
+    """
+    lines = [f"  {label}: {value}" for label, value in body]
+    return header + "\n" + "\n".join(lines)
+
+
+# stacklevel from ``warnings.warn`` to user code, traced through the
+# production call chain ``render_modules → print_F →
+# _classify_matmul_placeholders → _emit_l1_fallback_warnings → warn``
+# (5 frames) and ``render_modules → print_inner_J →
+# _emit_l2_fallback_warnings → warn`` (4 frames). When the emitters are
+# called directly from a test, the stacklevel overshoots into pytest
+# internals — that's fine because tests assert on message content, not
+# on warning location.
+_L1_STACKLEVEL = 5
+_L2_STACKLEVEL = 4
+
+
+def _emit_l1_fallback_warnings(all_triples, fast_candidates, PARAM,
+                               demotion_edges=None):
     """Emit one ``UserWarning`` per Mat_Mul fallback placeholder.
 
     Skips placeholders whose matrix is a dense ``dim=2`` Param —
@@ -658,6 +847,8 @@ def _emit_l1_fallback_warnings(all_triples, fast_candidates, PARAM):
     equally to inline mode (where Layer 1 / Layer 2 fallback
     distinctions don't exist).
     """
+    if demotion_edges is None:
+        demotion_edges = {}
     for name, mat, op in all_triples:
         if name in fast_candidates:
             continue
@@ -668,15 +859,158 @@ def _emit_l1_fallback_warnings(all_triples, fast_candidates, PARAM):
                     and getattr(p, 'dim', 0) == 2
                     and not getattr(p, 'sparse', False)):
                 continue
+        # Demotion root-cause traceback: if this placeholder would have
+        # been on the fast path by shape alone but was demoted because
+        # another fallback placeholder consumes it, tell the user which
+        # upstream placeholder to fix first.
+        if name in demotion_edges:
+            upstream = demotion_edges[name]
+            warnings.warn(
+                _format_fallback_warning(
+                    f"Mat_Mul placeholder {name!r} was demoted from the "
+                    f"fast path because {upstream!r} consumes it as an "
+                    f"operand and is itself on the fallback path.",
+                    [(f"Fix the upstream fallback ({upstream!r}) first",
+                      "demoted placeholders recover automatically")],
+                ),
+                UserWarning, stacklevel=_L1_STACKLEVEL
+            )
+            continue
         reason, expression_str, suggestion = _classify_l1_fallback_reason(
             mat, op, PARAM)
         warnings.warn(
-            f"Mat_Mul placeholder {name!r} falls back to scipy.sparse "
-            f"SpMV (slower than the @njit csc_matvec fast path).\n"
-            f"  Reason: {reason}\n"
-            f"  Expression: Mat_Mul({expression_str}, <operand>)\n"
-            f"  Suggested rewrite: {suggestion}",
-            UserWarning, stacklevel=4
+            _format_fallback_warning(
+                f"Mat_Mul placeholder {name!r} falls back to scipy.sparse "
+                f"SpMV (slower than the @njit csc_matvec fast path).",
+                [
+                    ("Reason", reason),
+                    ("Expression", f"Mat_Mul({expression_str}, <operand>)"),
+                    ("Suggested rewrite", suggestion),
+                ],
+            ),
+            UserWarning, stacklevel=_L1_STACKLEVEL
+        )
+
+
+def _classify_l2_fallback_reason(piece):
+    """Identify why a mutable Jacobian term landed in the analyzer's
+    fallback bucket and return ``(reason, suggestion)``.
+
+    Mirrors the structural checks in
+    :func:`analyze_mutable_mat_expr.handle`. After stripping the leading
+    sign, a term lands in ``fallback_pieces`` for one of these reasons:
+
+    * It is a ``Mat_Mul`` with ``Diag`` at both ends but the middle
+      factor isn't a recognised constant sparse matrix (biscale shape,
+      bad ``M``).
+    * It is a ``Mat_Mul`` with ``Diag`` at exactly one end but the other
+      side isn't a recognised constant sparse matrix.
+    * It is a ``Mat_Mul`` with no ``Diag`` at either end — neither
+      row-scale, col-scale, nor biscale shape.
+    * It is an element-wise ``Mul`` (Python ``*``), not a
+      ``Mat_Mul`` — operator mix-up.
+    * It is a bare ``Para`` matrix.
+    * Anything else.
+    """
+    # Local import avoids a circular import: this module is imported by
+    # the analyzer's owning package at module init time.
+    from Solverz.code_printer.python.module.mutable_mat_analyzer import (
+        _extract_sign_and_core,
+    )
+    _, core = _extract_sign_and_core(piece)
+
+    if isinstance(core, Mat_Mul):
+        args = list(core.args)
+        left_diag = bool(args) and isinstance(args[0], Diag)
+        right_diag = bool(args) and isinstance(args[-1], Diag)
+        # Two-arg ``Mat_Mul(Diag(u), Diag(v))`` has Diag at both ends but
+        # no middle factor. The biscale fast path requires len(args) >= 3
+        # in the analyzer (cf. ``_classify_matmul_biscale``); diag-times-
+        # diag is degenerate and the user almost certainly meant
+        # ``Diag(u * v)`` (two diagonals compose element-wise on the
+        # diagonal).
+        if left_diag and right_diag and len(args) == 2:
+            return (
+                "two-argument ``Mat_Mul(Diag(u), Diag(v))`` — both ends "
+                "are ``Diag`` but there's no middle matrix factor",
+                "rewrite as ``Diag(u * v)`` — two diagonal matrices "
+                "compose element-wise on their diagonals",
+            )
+        if left_diag and right_diag:
+            return (
+                "biscale shape ``Diag(u) @ M @ Diag(v)`` where ``M`` "
+                "isn't a recognised constant sparse matrix (must be a "
+                "sparse ``dim=2`` Param or a Mat_Mul chain of constants)",
+                "ensure the middle factor materialises to a constant "
+                "sparse matrix; if it depends on a variable, split the "
+                "term into a sum of supported shapes",
+            )
+        if left_diag or right_diag:
+            shape = "Diag(v) @ M" if left_diag else "M @ Diag(v)"
+            return (
+                f"single-Diag shape ``{shape}`` where ``M`` isn't a "
+                f"recognised constant sparse matrix",
+                "ensure the matrix factor materialises to a constant "
+                "sparse ``dim=2`` Param or a Mat_Mul chain of constants",
+            )
+        return (
+            "``Mat_Mul`` of matrix operands without a ``Diag`` wrapper "
+            "at either end — neither row-scale, col-scale, nor biscale",
+            "wrap one operand in ``Diag(...)`` to use a fast-path "
+            "shape, or split the term into a sum of supported shapes",
+        )
+
+    if isinstance(core, Mul):
+        diag_count = sum(1 for a in core.args if isinstance(a, Diag))
+        if diag_count:
+            return (
+                f"term is an element-wise ``Mul`` with {diag_count} "
+                f"``Diag`` factor(s), not a matrix-product (``Mat_Mul``)",
+                "rewrite as ``Mat_Mul(Diag(u), M, Diag(v))`` (or the "
+                "matching single-side shape) — Python ``*`` between "
+                "matrices is element-wise and doesn't match the "
+                "row/col/biscale fast paths",
+            )
+        return (
+            "term is an element-wise ``Mul`` of matrix operands, not "
+            "a matrix-product (``Mat_Mul``)",
+            "rewrite as ``Mat_Mul(...)`` so the analyzer can match a "
+            "row-scale / col-scale / biscale shape",
+        )
+
+    if isinstance(core, Para):
+        return (
+            "bare matrix ``Param`` not wrapped in ``Diag`` or "
+            "``Mat_Mul`` — no fast-path shape applies",
+            "wrap the matrix in ``Diag(...)`` if it represents a "
+            "diagonal contribution, or compose with a row/col scale "
+            "via ``Mat_Mul``",
+        )
+
+    return (
+        f"term shape ``{type(core).__name__}`` doesn't match any "
+        f"supported fast-path (Diag / row-scale / col-scale / biscale)",
+        "rewrite as one of: ``Diag(inner)``, ``Mat_Mul(Diag(v), M)``, "
+        "``Mat_Mul(M, Diag(v))``, or ``Mat_Mul(Diag(u), M, Diag(v))``",
+    )
+
+
+def _emit_l2_fallback_warnings(eqn_name, var_name, fallback_pieces):
+    """Emit one ``UserWarning`` per mutable Jacobian fallback piece."""
+    for piece in fallback_pieces:
+        reason, suggestion = _classify_l2_fallback_reason(piece)
+        warnings.warn(
+            _format_fallback_warning(
+                f"Mutable Jacobian block (eqn {eqn_name!r}, var "
+                f"{var_name!r}) contains a term that doesn't match the "
+                f"diag / row-scale / col-scale / biscale fast path.",
+                [
+                    ("Term", piece),
+                    ("Reason", reason),
+                    ("Suggested rewrite", suggestion),
+                ],
+            ),
+            UserWarning, stacklevel=_L2_STACKLEVEL
         )
 
 
