@@ -28,3 +28,5 @@ Solverz/_version.py
 /review_notes/
 # claude-mem session memory file injected by Codex transcript watch
 /AGENTS.md
+# Claude Code harness per-session lock files (ScheduleWakeup, /loop)
+.claude/*.lock
