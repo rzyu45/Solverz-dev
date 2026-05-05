@@ -26,3 +26,5 @@ Solverz/share
 Solverz/_version.py
 /.venv
 /review_notes/
+# claude-mem session memory file injected by Codex transcript watch
+/AGENTS.md
