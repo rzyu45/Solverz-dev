@@ -104,22 +104,8 @@ class sSymBasic:
 
 
 class Var(sSymBasic):
-    def __init__(self, name: str, value=None, init=None, over=None):
+    def __init__(self, name: str, value=None, init=None):
         super().__init__(name=name, Type='iVar', value=value, dim=1, init=init)
-        # Optional ``over=<IndexSet>`` documents that the variable's
-        # entries are indexed by a known ``Set`` (#136 Tier A). The
-        # length is validated against ``over.size`` at model-build time
-        # in :meth:`Model.create_instance`. ``IndexSet`` is imported
-        # lazily to avoid a circular import (variable → equation →
-        # variable).
-        if over is not None:
-            from Solverz.equation.eqn import IndexSet
-            if not isinstance(over, IndexSet):
-                raise TypeError(
-                    f"Var({name!r}, over=...) expected a Set / IndexSet, "
-                    f"got {type(over).__name__}"
-                )
-        self.over = over
 
 
 class AliasVar(sSymBasic):

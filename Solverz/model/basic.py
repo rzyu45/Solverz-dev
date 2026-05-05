@@ -107,18 +107,7 @@ class Model:
                 raise ValueError(f'Variable {name} not initialized and init func not provided!')
             elif var.value is None and var.init is not None:
                 self.init_var(name)
-            value = self.var_dict[name].value
-            # Tier-A check (#136): when the user declared ``over=Set(...)``
-            # confirm the materialised initial value matches the set's
-            # size. Catches ``Var('Vm', np.zeros(nb), over=m.PQ)`` where
-            # ``len(PQ) != nb``.
-            if var.over is not None and value.shape[0] != var.over.size:
-                raise ValueError(
-                    f"Var({name!r}, over={var.over.name!r}): initial-value "
-                    f"length {value.shape[0]} doesn't match set size "
-                    f"{var.over.size}"
-                )
-            a.add(name, value.shape[0])
+            a.add(name, self.var_dict[name].value.shape[0])
 
         array = np.zeros((a.total_size,))
         for var in a.object_list:
