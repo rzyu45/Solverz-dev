@@ -2134,7 +2134,8 @@ def build_loop_jac_kernel_source(func_name: str,
                                    symbols_list,
                                    var_map: Dict[str, object],
                                    row_arr_param: str = '_sz_row_arr',
-                                   col_arr_param: str = '_sz_col_arr') -> str:
+                                   col_arr_param: str = '_sz_col_arr',
+                                   walker_names=()) -> str:
     """Generate Python source for a **sparse** LoopEqn Jacobian
     block kernel.
 
@@ -2187,6 +2188,11 @@ def build_loop_jac_kernel_source(func_name: str,
         Parameter names for the row / col index arrays inside the
         generated function. The caller can pick unique names to
         avoid collision in the module-level scope.
+    walker_names : sequence of str
+        The ``_sz_csr_<M>_data`` / ``_indices`` / ``_indptr`` names of the
+        sparse Params the body reads, appended to the signature after the
+        row / col arrays and passed to the point-lookup helpers, so that
+        no compiled function reads a module-level array (issue #162).
 
     Returns
     -------
@@ -2267,7 +2273,9 @@ def build_loop_jac_kernel_source(func_name: str,
         all_point_helpers = state.get('sparse_point_helpers', set())
     for walker_name in sorted(all_point_helpers):
         helper_sources.append(
-            f"def _sz_csr_{walker_name}_point(row, col):\n"
+            f"def _sz_csr_{walker_name}_point(row, col, "
+            f"_sz_csr_{walker_name}_data, _sz_csr_{walker_name}_indices, "
+            f"_sz_csr_{walker_name}_indptr):\n"
             f"{indent}for _sz_pk in range("
             f"_sz_csr_{walker_name}_indptr[row], "
             f"_sz_csr_{walker_name}_indptr[row + 1]):\n"
@@ -2276,7 +2284,7 @@ def build_loop_jac_kernel_source(func_name: str,
             f"{indent}return 0.0\n"
         )
 
-    arg_list = list(symbols_list) + [row_arr_param, col_arr_param]
+    arg_list = list(symbols_list) + [row_arr_param, col_arr_param] + list(walker_names)
     lines = [
         f"def {func_name}({', '.join(arg_list)}):",
         f"{indent}data = np.empty({nnz})",
