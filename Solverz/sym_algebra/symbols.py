@@ -301,6 +301,21 @@ class coo_2_csc(Symbol):
         return self._numpycode(printer, **kwargs)
 
 
+class coo_2_csc_fixed(Symbol):
+    """The ``J_`` epilogue of the module printer: gather the fresh values
+    into the CSC pattern analysed once at import, the ``SolCF.CooToCsc``
+    named ``_sz_coo2csc`` in the generated ``dependency.py`` (issue #160)."""
+
+    def __new__(cls):
+        return Symbol.__new__(cls, 'coo_2_csc_fixed')
+
+    def _numpycode(self, printer, **kwargs):
+        return '_sz_coo2csc(data)'
+
+    def _pythoncode(self, printer, **kwargs):
+        return self._numpycode(printer, **kwargs)
+
+
 class coo_2_csc_hvp(Symbol):
 
     def __new__(cls, eqn_size: int, vsize: int):

@@ -172,7 +172,8 @@ def print_J(eqs_type: str,
             PARAM: Dict[str, ParamBase],
             shape: List[int],
             nstep: int = 0,
-            mutable_matrix_blocks=None):
+            mutable_matrix_blocks=None,
+            inner_J_extra_args=()):
     if eqn_size != var_addr.total_size:
         raise ValueError(f"Jac matrix, with size ({eqn_size}*{var_addr.total_size}), not square")
     fp = print_F_J_prototype(eqs_type,
@@ -189,7 +190,8 @@ def print_J(eqs_type: str,
     body.extend(param_assignments)
     body.extend(print_trigger(PARAM))
     body.extend([Assignment(iVar('data', internal_use=True),
-                            FunctionCall('inner_J', [symbols('_data_', real=True)] + var_list + param_list))])
+                            FunctionCall('inner_J', [symbols('_data_', real=True)] + var_list + param_list
+                                         + [symbols(nm, real=True) for nm in inner_J_extra_args]))])
     # Mutable matrix Jacobian blocks. Two modes:
     #
     # 1. 'vectorized' — the block's expression is a sum of recognised term
@@ -274,7 +276,7 @@ def print_J(eqs_type: str,
                 body.append(Assignment(
                     iVar('data', internal_use=True)[mb['addr_slice']],
                     MutableMatJacDataModule(mb['expr'], mb['coo_row'], mb['coo_col'])))
-    body.extend([Return(coo_2_csc(shape[0], shape[1]))])
+    body.extend([Return(coo_2_csc_fixed())])
     fd = FunctionDefinition.from_FunctionPrototype(fp, body)
     return pycode(fd, fully_qualified_modules=False)
 
@@ -293,7 +295,6 @@ def print_inner_J(var_addr: Address,
     args = []
     for var in var_list + param_list:
         args.append(symbols(var.name, real=True))
-    fp = FunctionPrototype(real, 'inner_J', [symbols('_data_', real=True)] + args)
     body = []
 
     code_sub_inner_J_blocks = []
@@ -365,6 +366,7 @@ def print_inner_J(var_addr: Address,
                         'kernel_symbols': sorted(ed.SYMBOLS.keys()),
                         'row_key': row_key,
                         'col_key': col_key,
+                        'walker_args': list(ed.walker_arg_names),
                     })
                     addr_by_ele_0 += jb.SpEleSize
                     continue
@@ -467,29 +469,40 @@ def print_inner_J(var_addr: Address,
     # whole assembly happens inside a single ``@njit`` compilation
     # unit. Each kernel is itself ``@njit``-decorated, so the call
     # is inlined by numba at JIT time — no Python/numba boundary
-    # crossing per kernel call at runtime. Row / col arrays are
-    # module-level numpy globals (``_sz_loop_jac_row_<N>`` /
-    # ``_sz_loop_jac_col_<N>``), which numba accepts via global
-    # capture when the function is compiled.
+    # crossing per kernel call at runtime. The row / col arrays of the
+    # kernels (``_sz_loop_jac_row_<N>`` / ``_sz_loop_jac_col_<N>``) and
+    # the CSR arrays of their sparse walkers enter ``inner_J`` as
+    # arguments from the ``J_`` wrapper, not as module-level globals:
+    # Numba treats a global array above 1 MB as a dynamic global and
+    # then refuses to cache the function (issue #162).
+    extra_names = []
     for mb in mutable_matrix_blocks:
         if mb.get('mode') != 'loop_eqn':
             continue
+        for nm in [mb['row_key'], mb['col_key']] + list(mb['walker_args']):
+            if nm not in extra_names:
+                extra_names.append(nm)
         kernel_args = [symbols(nm, real=True)
                        for nm in mb['kernel_symbols']]
+        walker_syms = [symbols(nm, real=True) for nm in mb['walker_args']]
         row_sym = symbols(mb['row_key'], real=True)
         col_sym = symbols(mb['col_key'], real=True)
         body.append(Assignment(
             iVar('_data_', internal_use=True)[mb['addr_slice']],
             FunctionCall(
                 mb['kernel_fn_name'],
-                kernel_args + [row_sym, col_sym],
+                kernel_args + [row_sym, col_sym] + walker_syms,
             ),
         ))
 
+    fp = FunctionPrototype(real, 'inner_J',
+                           [symbols('_data_', real=True)] + args
+                           + [symbols(nm, real=True) for nm in extra_names])
     temp = iVar('_data_', internal_use=True)
     body.extend([Return(temp)])
     fd = FunctionDefinition.from_FunctionPrototype(fp, body)
     return {'code_inner_J': pycode(fd, fully_qualified_modules=False),
+            'inner_J_extra_args': extra_names,
             'code_sub_inner_J': code_sub_inner_J_blocks,
             'no_njit_sub_inner_J': no_njit_indices,
             'mutable_matrix_blocks': mutable_matrix_blocks,
@@ -1053,7 +1066,8 @@ def print_F(eqs_type: str,
             var_addr: Address,
             PARAM: Dict[str, ParamBase],
             nstep: int = 0,
-            precompute_info=None):
+            precompute_info=None,
+            walker_args=()):
     """Print the F_ wrapper.
 
     ``Mat_Mul(A, x)`` precomputes are split into two paths:
@@ -1145,7 +1159,8 @@ def print_F(eqs_type: str,
 
     body.extend(
         [Return(FunctionCall('inner_F',
-                             [symbols('_F_', real=True)] + var_list + param_list + inner_extra_args))])
+                             [symbols('_F_', real=True)] + var_list + param_list + inner_extra_args
+                             + [symbols(w, real=True) for w in walker_args]))])
     fd = FunctionDefinition.from_FunctionPrototype(fp, body)
     return pycode(fd, fully_qualified_modules=False)
 
@@ -1155,7 +1170,8 @@ def print_inner_F(EQNs: Dict[str, Eqn],
                   var_addr: Address,
                   PARAM: Dict[str, ParamBase],
                   nstep: int = 0,
-                  precompute_info=None):
+                  precompute_info=None,
+                  walker_args=()):
     """Print the @njit ``inner_F`` dispatcher.
 
     For fast-path ``Mat_Mul(A, op)`` placeholders (where ``A`` is a
@@ -1208,7 +1224,9 @@ def print_inner_F(EQNs: Dict[str, Eqn],
     for placeholder in fallback_placeholders:
         args.append(symbols(placeholder.name, real=True))
 
-    fp = FunctionPrototype(real, 'inner_F', [symbols('_F_', real=True)] + args)
+    # CSR arrays of the LoopEqn walkers, handed down from F_ (issue #162)
+    fp = FunctionPrototype(real, 'inner_F', [symbols('_F_', real=True)] + args
+                           + [symbols(w, real=True) for w in walker_args])
     body = []
 
     # Emit the fast-path matvec prelude before any equation assignments.
@@ -1268,7 +1286,8 @@ def print_eqn_assignment_with_precompute(EQNs, EqnAddr, precompute_info):
         elif isinstance(eqn, LoopEqn):
             # Exclude sparse walker Params (they're module-level CSR
             # constants, not call arguments).
-            sub_args = [eqn.SYMBOLS[nm] for nm in eqn.njit_arg_names()]
+            sub_args = ([eqn.SYMBOLS[nm] for nm in eqn.njit_arg_names()]
+                        + [symbols(w, real=True) for w in eqn.walker_arg_names()])
         else:
             # Preserve original behavior for non-matrix equations
             sub_args = list(eqn.SYMBOLS.values())
@@ -1319,7 +1338,7 @@ def print_sub_inner_F(EQNs: Dict[str, Eqn]):
             # from the sub-function's signature. Their CSR arrays are
             # pulled from module-level constants injected via
             # ``mut_mat_mappings`` by ``render_modules``.
-            arg_names = eqn.njit_arg_names()
+            arg_names = eqn.njit_arg_names() + eqn.walker_arg_names()
             args = [symbols(v, real=True) for v in arg_names]
             _doc = f"{eqn_name}{format_source(getattr(eqn, 'source', None))}"
             code_blocks.append(_with_docstring(

@@ -83,17 +83,25 @@ def render_modules(eqs: SymEquations,
     # Precompute architecture: sub_inner_F no longer receives sparse matrices,
     # so all sub-functions can now be @njit (empty no_njit set).
     code_dict["no_njit_sub_inner_F"] = set()
+    # CSR arrays of every LoopEqn walker: F_ hands them to inner_F and
+    # inner_F to the inner_F<N> that walks them, so no compiled function
+    # reads a module-level array and Numba can cache all of them (#162).
+    from Solverz.equation.eqn import LoopEqn as _LoopEqnCls
+    walker_args = sorted({w for _eqn in eqs.EQNs.values() if isinstance(_eqn, _LoopEqnCls)
+                          for w in _eqn.walker_arg_names()})
     code_dict['F'] = print_F(eqs.__class__.__name__,
                              eqs.var_address,
                              eqs.PARAM,
                              eqs.nstep,
-                             precompute_info=precompute_info_F)
+                             precompute_info=precompute_info_F,
+                             walker_args=walker_args)
     code_dict["inner_F"] = print_inner_F(eqs.EQNs,
                                          eqs.a,
                                          eqs.var_address,
                                          eqs.PARAM,
                                          eqs.nstep,
-                                         precompute_info=precompute_info_F)
+                                         precompute_info=precompute_info_F,
+                                         walker_args=walker_args)
 
     source_map = {n: getattr(e, 'source', None) for n, e in eqs.EQNs.items()}
 
@@ -124,7 +132,8 @@ def render_modules(eqs: SymEquations,
                              eqs.PARAM,
                              eqs.jac.shape,
                              eqs.nstep,
-                             mutable_matrix_blocks=J.get('mutable_matrix_blocks'))
+                             mutable_matrix_blocks=J.get('mutable_matrix_blocks'),
+                             inner_J_extra_args=J.get('inner_J_extra_args', []))
     code_dict["inner_J"] = J['code_inner_J']
     code_dict["sub_inner_J"] = J['code_sub_inner_J']
     if J.get('no_njit_sub_inner_J'):
@@ -152,12 +161,12 @@ def render_modules(eqs: SymEquations,
 
     # LoopEqn CSR walker arrays — pre-computed ``.tocsr()`` views of
     # any sparse 2-D Param referenced as ``M[outer, dummy]`` inside a
-    # ``Sum`` body. These arrays ride as module-level constants via
-    # the same ``mut_mat_mappings`` → ``eqn_parameter`` → pickle →
+    # ``Sum`` body. They ride to the module through the same
+    # ``mut_mat_mappings`` → ``eqn_parameter`` → pickle →
     # ``setting["<key>"] = ...`` pipeline used by mutable matrix
-    # Jacobian blocks, so the @njit ``inner_F<N>`` that references
-    # them sees plain numpy arrays rather than scipy.sparse objects
-    # at numba compile time.
+    # Jacobian blocks, and the Python-level ``F_`` / ``J_`` wrappers pass
+    # them down as arguments so that no @njit function reads a global
+    # array, which would disable Numba's cache above 1 MB (issue #162).
     from Solverz.equation.eqn import LoopEqn as _LoopEqnCls
     for _eqn in eqs.EQNs.values():
         if not isinstance(_eqn, _LoopEqnCls):
@@ -212,7 +221,8 @@ def render_modules(eqs: SymEquations,
         raise ValueError(f'Unknown equation type {type(eqs)}')
 
     row, col, data = eqs.jac.parse_row_col_data()
-    eqn_parameter.update({'row': row, 'col': col, 'data': data})
+    eqn_parameter.update({'row': row, 'col': col, 'data': data,
+                          'jac_shape': tuple(int(s) for s in eqs.jac.shape)})
     # Store mutable matrix block mapping arrays (loaded from setting at
     # runtime, passed to the block @njit functions).
     if mut_mat_mappings:
@@ -373,6 +383,8 @@ def print_module_code(code_dict: Dict[str, str], numba=False):
     code = 'from .dependency import *\n'
     code += """_data_ = setting["data"]\n"""
     code += """_data_hvp = setting["data_hvp"]\n"""
+    # the CSC pattern of J_ is analysed once at import; J_ only gathers the values (issue #160)
+    code += '_sz_coo2csc = SolCF.CooToCsc(row, col, setting["jac_shape"])\n'
     code += """_F_ = zeros_like(y__, dtype=float64)\n"""
     # Load mutable matrix block mapping arrays from setting at module-level
     # so the J_ wrapper can reference them directly (and numba sees typed

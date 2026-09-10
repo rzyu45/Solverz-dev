@@ -171,7 +171,7 @@ expected = """def J_(t, y_, p_):
     A = p_["A"]
     ax = ax_trigger_func(x)
     data = inner_J(_data_, omega, delta, x, y, ax, lam, G6)
-    return sps.coo_array((data, (row, col)), (25, 25)).tocsc()
+    return _sz_coo2csc(data)
 """.strip()
 expected1 = """def J_(t, y_, p_, y_0):
     omega = y_[0:10]
@@ -188,7 +188,7 @@ expected1 = """def J_(t, y_, p_, y_0):
     A = p_["A"]
     ax = ax_trigger_func(x)
     data = inner_J(_data_, omega, delta, x, y, omega_tag_0, delta_tag_0, x_tag_0, y_tag_0, ax, lam, G6)
-    return sps.coo_array((data, (row, col)), (25, 25)).tocsc()
+    return _sz_coo2csc(data)
 """.strip()
 
 
