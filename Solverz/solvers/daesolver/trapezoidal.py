@@ -68,6 +68,7 @@ def implicit_trapezoid(dae: nDAE,
         ae = nAE(lambda y_, p_: dt / 2 * (dae.F(t0 + dt, y_, p_) + F0) - dae.M @ y_ + My0,
                  lambda y_, p_: -dae.M + dt / 2 * dae.J(t0 + dt, y_, p_),
                  p)
+        ae._klu_cache = model_cache(dae)  # one ordering for every step
         stats.nfeval += 1
 
         sol = nr_method(ae, y0, Opt(stats=True, ite_tol=opt.ite_tol))

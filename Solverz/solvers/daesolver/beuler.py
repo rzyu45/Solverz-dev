@@ -68,6 +68,7 @@ def backward_euler(dae: nDAE,
         ae = nAE(lambda y_, p_: dae.M @ y_ - My0 - dt * dae.F(t0 + dt, y_, p_),
                  lambda y_, p_: dae.M - dt * dae.J(t0 + dt, y_, p_),
                  p)
+        ae._klu_cache = model_cache(dae)  # one ordering for every step
 
         sol = nr_method(ae, y0, Opt(stats=True))
         y1 = sol.y
