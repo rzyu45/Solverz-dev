@@ -73,10 +73,25 @@ jobs:
     - name: Install Main Repository as Dependency using Git URL
       run: |
         uv venv
-        uv pip install git+https://github.com/${{github.repository}}.git@${{ github.sha }}
         uv pip install git+https://github.com/rzyu45/SolUtil@master
         uv pip install pytest pytest-xdist pytest-datadir
         uv pip install . --no-deps
+        # Last, so nothing installed afterwards can replace it.
+        uv pip install git+https://github.com/${{github.repository}}.git@${{ github.sha }}
+
+    # A dependency installed after Solverz may declare a Solverz version
+    # range. When the range excludes the commit under test, uv silently
+    # uninstalls it and puts the newest admitted PyPI release in its place,
+    # and every test below then reports on a Solverz that is not the one
+    # being gated. Six consecutive runs on a fork whose newest tag is 0.8.2
+    # passed that way: setuptools_scm derived 0.8.2.dev72 from the same
+    # commit that derives 0.10.3.dev22 here, SolMuseum's
+    # "Solverz>=0.10.0,<0.11" replaced it with 0.10.2, and the job went
+    # green while the real code failed. Installing the commit last keeps it,
+    # and this step makes any future replacement loud instead of silent.
+    - name: Assert the Solverz under test is this commit
+      run: |
+        .venv\Scripts\python -c 'import json, sys; from importlib.metadata import distribution, version; raw = distribution("Solverz").read_text("direct_url.json"); print("installed Solverz", version("Solverz"), raw); sys.exit(0 if raw and json.loads(raw).get("vcs_info", {}).get("commit_id") == "${{ github.sha }}" else "the installed Solverz is not the commit under test: a dependency range replaced it with a PyPI release")'
 
     - name: Run Tests
       run: |
@@ -118,10 +133,25 @@ jobs:
     - name: Install Main Repository as Dependency using Git URL
       run: |
         uv venv
-        uv pip install git+https://github.com/${{github.repository}}.git@${{ github.sha }}
         uv pip install git+https://github.com/rzyu45/SolUtil@master
         uv pip install SolMuseum
         uv pip install pytest pytest-xdist pytest-datadir pandas openpyxl
+        # Last, so nothing installed afterwards can replace it.
+        uv pip install git+https://github.com/${{github.repository}}.git@${{ github.sha }}
+
+    # A dependency installed after Solverz may declare a Solverz version
+    # range. When the range excludes the commit under test, uv silently
+    # uninstalls it and puts the newest admitted PyPI release in its place,
+    # and every test below then reports on a Solverz that is not the one
+    # being gated. Six consecutive runs on a fork whose newest tag is 0.8.2
+    # passed that way: setuptools_scm derived 0.8.2.dev72 from the same
+    # commit that derives 0.10.3.dev22 here, SolMuseum's
+    # "Solverz>=0.10.0,<0.11" replaced it with 0.10.2, and the job went
+    # green while the real code failed. Installing the commit last keeps it,
+    # and this step makes any future replacement loud instead of silent.
+    - name: Assert the Solverz under test is this commit
+      run: |
+        .venv\Scripts\python -c 'import json, sys; from importlib.metadata import distribution, version; raw = distribution("Solverz").read_text("direct_url.json"); print("installed Solverz", version("Solverz"), raw); sys.exit(0 if raw and json.loads(raw).get("vcs_info", {}).get("commit_id") == "${{ github.sha }}" else "the installed Solverz is not the commit under test: a dependency range replaced it with a PyPI release")'
 
     - name: Run Tests
       run: |

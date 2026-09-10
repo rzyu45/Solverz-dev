@@ -2929,8 +2929,6 @@ def test_issue151_plain_idx_shorter_than_param_rows_linear_body():
     _issue151_check('idx', linear=True)
 
 
-
-
 def _assert_canonical_sane(name, canonical):
     """Delegate to the production invariant check so the test and the
     library can never drift apart. See
