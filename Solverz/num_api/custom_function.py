@@ -223,3 +223,52 @@ def csc_matvec(data, indices, indptr, shape, x):
             i = indices[idx]
             res[i] += data[idx] * x[j]
     return res
+
+
+class CooToCsc:
+    """Fixed-pattern COO to CSC conversion for the generated ``J_``.
+
+    The pattern ``(row, col)`` of a generated Jacobian never changes
+    between calls, only the values do, so the sort and the duplicate
+    merge that ``coo_array(...).tocsc()`` repeats at every call are done
+    once here. A call gathers the fresh values into the CSC order and,
+    when the pattern has duplicate entries, sums them as scipy does
+    (issue #160).
+    """
+
+    def __init__(self, row, col, shape):
+        m, n = int(shape[0]), int(shape[1])
+        row = np.asarray(row, dtype=np.int64).ravel()
+        col = np.asarray(col, dtype=np.int64).ravel()
+        if row.shape != col.shape:
+            raise ValueError("row and col must have the same length")
+        key = col * m + row                           # CSC order: column-major, rows ascending
+        order = np.argsort(key, kind='stable')
+        key_sorted = key[order]
+        first = np.ones(key_sorted.size, dtype=bool)
+        first[1:] = key_sorted[1:] != key_sorted[:-1]
+        unique_key = key_sorted[first]
+        self.shape = (m, n)
+        self.nnz = int(unique_key.size)
+        self.indices = (unique_key % m).astype(np.int32)
+        self.indptr = np.zeros(n + 1, dtype=np.int32)
+        self.indptr[1:] = np.cumsum(np.bincount(unique_key // m, minlength=n))
+        self.has_duplicates = self.nnz != key.size
+        if self.has_duplicates:
+            slot = np.empty(key.size, dtype=np.int64)  # COO entry -> CSC slot
+            slot[order] = np.cumsum(first) - 1
+            self.slot, self.order = slot, None
+        else:
+            self.slot, self.order = None, order
+
+    def __call__(self, data):
+        data = np.asarray(data)
+        if self.has_duplicates:
+            if np.iscomplexobj(data):
+                values = np.zeros(self.nnz, dtype=data.dtype)
+                np.add.at(values, self.slot, data)
+            else:
+                values = np.bincount(self.slot, weights=data, minlength=self.nnz)
+        else:
+            values = data[self.order]
+        return csc_array((values, self.indices, self.indptr), shape=self.shape)
