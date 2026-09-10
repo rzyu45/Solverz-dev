@@ -5,6 +5,7 @@ import tqdm
 
 from Solverz.num_api.num_eqn import nFDAE, nAE
 from Solverz.solvers.nlaesolver import nr_method
+from Solverz.solvers.laesolver import model_cache
 from Solverz.solvers.stats import Stats
 from Solverz.solvers.option import Opt
 from Solverz.solvers.parser import fdae_io_parser
@@ -104,6 +105,7 @@ def fdae_solver(fdae: nFDAE,
         ae = nAE(lambda y_, p_: fdae.F(t0 + dt, y_, p_, *[Y[nt - i, :] for i in range(fdae.nstep)]),
                  lambda y_, p_: fdae.J(t0 + dt, y_, p_, *[Y[nt - i, :] for i in range(fdae.nstep)]),
                  p)
+        ae._klu_cache = model_cache(fdae)  # one ordering for every step
 
         sol = nr_method(ae, y0, Opt(ite_tol=opt.ite_tol, stats=True))
         ynew = sol.y

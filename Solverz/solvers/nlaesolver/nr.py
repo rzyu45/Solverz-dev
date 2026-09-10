@@ -43,9 +43,12 @@ def nr_method(eqn: nAE,
     p = eqn.p
     df = eqn.F(y, p)
     stats.nfeval += 1
-    # Reuse the KLU symbolic ordering across iterations: the Jacobian pattern
-    # is fixed, so only its values change between Newton steps.
-    cache = KLUCache()
+    # Reuse the KLU symbolic ordering across the iterations and across the
+    # calls: the Jacobian pattern of an nAE is fixed, so only its values change
+    # between Newton steps, and a repeated solve of the same equations must not
+    # pay the symbolic analysis and the row matching again. The holder lives on
+    # the nAE (laesolver.model_cache); a pattern change is detected there.
+    cache = model_cache(eqn)
 
     # main loop
     while np.max(np.abs(df)) > tol:
