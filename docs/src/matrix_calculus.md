@@ -709,7 +709,8 @@ intermediate sparse matrices per call, sum them (with explicit-zero
 elimination), and then perform a linear-scan lookup for each output
 position. On a 30-bus power flow case, each `J_(y, p)` call took
 ≈ 280 µs in that pre-0.8 architecture. The scatter-add Numba path
-introduced in 0.8.0 drops that to ≈ 50 µs while producing
+introduced in 0.8.0 dropped that to ≈ 50 µs, and on Solverz 0.11.0 the
+same call takes ≈ 36 µs, while producing
 bit-identical results.
 
 If you want to know whether a particular block in your model is on
@@ -796,6 +797,17 @@ power-flow case does not.
   Cookbook's `bench_pf_matmul_vs_polar.py`; the per-`J_` numbers
   below were captured by importing the rendered DHS module and
   calling `mdl.J(y, mdl.p)` in a tight loop.
+
+```{note}
+The DHS table below is a historical record. It was measured on
+`Solverz==0.8.1` against a `Mat_Mul` formulation of the district-heating
+hydraulics that SolUtil no longer carries: `SolUtil.energyflow.dhs_flow`
+now builds the model from scalar `Eqn`s in a Python loop and contains no
+`Mat_Mul` call, so neither `Mat_Mul` row can be reproduced from it. The
+ratios still illustrate the point of this chapter, but do not read them as
+current figures. See the Cookbook's power-flow chapter for a `Mat_Mul`
+comparison measured on the current release.
+```
 
 **DHS hydraulic subproblem on `BarryIsland`** (35 unknowns, 1 loop,
 1 mutable-matrix block — the loop pressure Jacobian contains two

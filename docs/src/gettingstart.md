@@ -307,7 +307,7 @@ industry-standard LLVM compiler library. Numba-compiled numerical algorithms in 
 
 If one wants to take advantage of the dynamic compilation, just set the `jit` arg in `module_printer` to be `True`. 
 Then the models will be compiled at the first time of function evaluation. 
-Though the compilation time of complex models can be of tens of minutes, the compilation results are cached locally. 
+Though the compilation time of complex models can be of several minutes, the largest measured in [#134](https://github.com/smallbunnies/Solverz/issues/134) being about six minutes for a model that renders 1\,230 kernels, the compilation results are cached locally. 
 Hence, the model should be compiled only once. 
 It is recommended to first set `jit=False` to debug the models and then perform dynamic compilation.
 Currently, dynamic compilation is not supported in `made_numerical`.
