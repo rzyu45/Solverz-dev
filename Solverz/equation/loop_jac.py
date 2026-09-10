@@ -87,32 +87,29 @@ def _references_index(expr, idx) -> bool:
 def check_canonical_invariants(canonical: sp.Expr,
                                 eqn_name: str = '',
                                 var_name: str = '') -> List[str]:
-    """Report the two states of a canonical Jacobian expression that
-    always mean a defect upstream, and that both produce a silently
-    WRONG Jacobian rather than a slow one.
+    """Report two states of a canonical Jacobian expression that mean a
+    defect upstream. They differ in severity, and the messages say so.
 
-    1. **Two free symbols share a printed name.** Two index objects
-       with the same label are the same index. Carrying both means
-       some part of the pipeline rebuilt one of them into an object
-       that no longer compares equal to the other, so every structural
-       test downstream, ``_canonicalize_sum`` and
-       ``compute_loop_jac_sparsity`` alike, matches only one of the two
-       and silently misclassifies the term. ``Set.idx`` returning a
-       ``SetIdx`` rather than a plain ``sp.Idx`` is what makes this
-       state reachable, since a ``SetIdx`` and an ``sp.Idx`` of the
-       same label and bounds compare unequal by design (issue #161).
+    1. **Two free symbols share a printed name.** Every structural test
+       in this module compares indices by label, so it reads the two as
+       one index. That is right when they denote the same thing and
+       wrong when they do not, and nothing here can tell which. Two
+       ``SetIdx`` with different tokens come from two different ``Set``
+       objects, that is, from two model constructions whose symbols have
+       met; if those sets hold different members, the gather is silently
+       taken through the wrong one. The state is always a defect
+       upstream, but it does not by itself make the Jacobian wrong.
 
-    2. **A ``Sum`` dummy is free.** A bound dummy that appears in
-       ``free_symbols`` has escaped its ``Sum``: a factor naming it was
-       lifted out. This is the stale-reference hazard
-       :func:`_canonicalize_sum` guards against at its ``dummy in
-       f.free_symbols`` test, and the generated kernel then reads
-       whatever value the loop variable last held.
+    2. **A ``Sum`` dummy also occurs outside every ``Sum``.** A factor
+       naming a bound dummy was lifted out of the ``Sum`` it belongs to,
+       and the generated kernel then reads whatever value the loop
+       variable last held. This one does make the Jacobian wrong, and
+       finitely so, which is why nothing downstream notices.
 
-    Returns the list of problem descriptions, empty when the
-    expression is sound. Callers warn rather than raise, so a model
-    that hits this still runs and can be compared against a
-    finite-difference Jacobian.
+    Returns the list of problem descriptions, empty when the expression
+    is sound. Callers warn rather than raise, so a model that hits
+    either still runs and can be checked against a finite-difference
+    Jacobian.
     """
     problems: List[str] = []
 
@@ -152,11 +149,21 @@ def check_canonical_invariants(canonical: sp.Expr,
 
     if problems:
         where = ' '.join(x for x in (eqn_name, var_name) if x)
+        # Only the escaped dummy makes the Jacobian wrong. Say which
+        # this is, so a warning about the milder state does not read as
+        # an alarm about a result that is in fact correct.
+        wrong = any('outside every Sum' in x for x in problems)
+        severity = (
+            "The generated Jacobian is wrong, not merely over-reserved."
+            if wrong else
+            "The Jacobian is still assembled by label, so it is correct as "
+            "long as the indices sharing a label denote the same thing, "
+            "which is not checked here."
+        )
         warnings.warn(
             "LoopEqn canonical Jacobian is structurally unsound"
             + (f" for {where}" if where else "")
-            + ". The generated Jacobian will be wrong, not merely "
-              "over-reserved. "
+            + f". {severity} "
             + "; ".join(problems)
             + f". Canonical: {canonical}",
             stacklevel=3)
