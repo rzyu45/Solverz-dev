@@ -212,7 +212,8 @@ def render_modules(eqs: SymEquations,
         raise ValueError(f'Unknown equation type {type(eqs)}')
 
     row, col, data = eqs.jac.parse_row_col_data()
-    eqn_parameter.update({'row': row, 'col': col, 'data': data})
+    eqn_parameter.update({'row': row, 'col': col, 'data': data,
+                          'jac_shape': tuple(int(s) for s in eqs.jac.shape)})
     # Store mutable matrix block mapping arrays (loaded from setting at
     # runtime, passed to the block @njit functions).
     if mut_mat_mappings:
@@ -373,6 +374,8 @@ def print_module_code(code_dict: Dict[str, str], numba=False):
     code = 'from .dependency import *\n'
     code += """_data_ = setting["data"]\n"""
     code += """_data_hvp = setting["data_hvp"]\n"""
+    # the CSC pattern of J_ is analysed once at import; J_ only gathers the values (issue #160)
+    code += '_sz_coo2csc = SolCF.CooToCsc(row, col, setting["jac_shape"])\n'
     code += """_F_ = zeros_like(y__, dtype=float64)\n"""
     # Load mutable matrix block mapping arrays from setting at module-level
     # so the J_ wrapper can reference them directly (and numba sees typed

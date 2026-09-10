@@ -263,3 +263,37 @@ def test_generated_module_with_nonascii_source_is_utf8_and_imports():
     # And it must import without a SyntaxError (the original failure mode).
     sys.path.insert(0, os.path.dirname(mod))
     importlib.import_module(os.path.basename(mod))
+
+
+def test_rendered_j_gathers_into_a_precomputed_csc_pattern(tmp_path):
+    """The generated ``J_`` no longer converts COO to CSC on every call (issue #160)."""
+    import importlib
+    import sys
+
+    import numpy as np
+    import scipy.sparse as sps
+
+    from Solverz import Model, Var, Param, Eqn, AE, module_printer
+
+    m = Model()
+    m.x = Var('x', np.array([1.0, 2.0, 3.0]))
+    m.a = Param('a', np.array([2.0, 3.0, 4.0]))
+    m.e = Eqn('e', m.a * m.x ** 2 - 1)
+    m.F = AE(name='F', eqn=m.e)
+    spf, y0 = m.create_instance()
+    name = 'sz_test_coo2csc'
+    module_printer(spf, y0, name, directory=str(tmp_path), jit=False).render()
+    num_func = (tmp_path / name / 'num_func.py').read_text()
+    assert '_sz_coo2csc = SolCF.CooToCsc(row, col, setting["jac_shape"])' in num_func
+    assert 'return _sz_coo2csc(data)' in num_func
+    assert 'sps.coo_array((data, (row, col))' not in num_func
+    sys.path.insert(0, str(tmp_path))
+    try:
+        mod = importlib.import_module(name)
+        J = mod.mdl.J(mod.y, mod.mdl.p)
+        ref = sps.csc_array(sps.diags(2 * np.array([2.0, 3.0, 4.0]) * np.array([1.0, 2.0, 3.0])))
+        assert isinstance(J, sps.csc_array) and abs(J - ref).max() < 1e-12
+    finally:
+        sys.path.remove(str(tmp_path))
+        for k in [k for k in sys.modules if k.startswith(name)]:
+            del sys.modules[k]

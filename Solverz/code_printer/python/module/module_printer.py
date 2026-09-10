@@ -274,7 +274,7 @@ def print_J(eqs_type: str,
                 body.append(Assignment(
                     iVar('data', internal_use=True)[mb['addr_slice']],
                     MutableMatJacDataModule(mb['expr'], mb['coo_row'], mb['coo_col'])))
-    body.extend([Return(coo_2_csc(shape[0], shape[1]))])
+    body.extend([Return(coo_2_csc_fixed())])
     fd = FunctionDefinition.from_FunctionPrototype(fp, body)
     return pycode(fd, fully_qualified_modules=False)
 
