@@ -18,6 +18,7 @@ import os
 import sys
 import tempfile
 import uuid
+import warnings
 
 import numpy as np
 import sympy as sp
@@ -2989,3 +2990,207 @@ def test_loop_eqn_walker_above_one_megabyte_is_cached_by_numba(tmp_path):
         sys.path.remove(str(tmp_path))
         for k in [k for k in sys.modules if k.startswith(name)]:
             del sys.modules[k]
+
+
+def _sum_dummies(expr):
+    """Every bound dummy of every ``Sum`` inside ``expr``."""
+    return {d for node in expr.atoms(sp.Sum) for d in node.variables}
+
+
+def _assert_canonical_sane(name, canonical):
+    """Two structural invariants every canonical Jacobian expression must
+    hold, both of which produce a silently WRONG Jacobian when violated.
+
+    1. No two free symbols share a printed name. Two index objects with
+       the same label are the same index; carrying both means some part
+       of the pipeline rebuilt one of them and the two no longer compare
+       equal, so every structural test downstream picks the wrong one.
+    2. No ``Sum`` dummy is free. A bound dummy that appears in
+       ``free_symbols`` has escaped its ``Sum`` — the stale-reference
+       hazard ``_canonicalize_sum`` guards against — and the generated
+       kernel then reads whatever value the loop variable last held.
+    """
+    free = list(canonical.free_symbols)
+    by_label = {}
+    for s in free:
+        by_label.setdefault(str(s), []).append(s)
+    dupes = {lab: objs for lab, objs in by_label.items() if len(objs) > 1}
+    assert not dupes, (
+        f"{name}: {len(dupes)} label(s) carried by more than one object: "
+        + "; ".join(
+            f"{lab!r} -> " + " vs ".join(
+                f"{type(o).__name__}{o.args}" for o in objs)
+            for lab, objs in dupes.items()
+        )
+    )
+
+    free_labels = {str(s) for s in free}
+    escaped = sorted(str(d) for d in _sum_dummies(canonical)
+                     if str(d) in free_labels)
+    assert not escaped, (
+        f"{name}: Sum dummy {escaped} appears free — a factor referencing "
+        f"it was lifted out of its Sum. Canonical: {canonical}"
+    )
+
+
+def _polar_pf_model(nb=6, jit=False):
+    """A model with the exact shape of SolUtil's polar power flow.
+
+    Four ``Set``s of three different kinds meet in one model, which is
+    what makes this the regression case for the whole ``Set`` /
+    ``LoopEqn`` interaction:
+
+    - ``Bus``, an identity set whose size equals the target length, so
+      its index stays bare and serves as the ``Sum`` dummy;
+    - ``PVPQ`` and ``PQ``, genuine subsets, so their accesses are
+      gathered and reach the analyzer as ``PVPQ[i_p]``;
+    - ``RefPV`` and ``Ref``, identity sets SHORTER than the target, so
+      they are gathered as well.
+
+    Injections are back-solved from a chosen operating point, so the
+    Newton solve from a flat start must recover it exactly.
+    """
+    from Solverz import Set
+
+    ref = [0]
+    pv = [1, 2]
+    pq = list(range(3, nb))
+    pv_pq_arr = np.array(pv + pq, dtype=int)
+    pq_arr = np.array(pq, dtype=int)
+    ref_pv_arr = np.array(ref + pv, dtype=int)
+    ref_arr = np.array(ref, dtype=int)
+
+    # Ring plus chords, with shunts so the Jacobian is not singular.
+    Y = np.zeros((nb, nb), dtype=complex)
+    for a in range(nb):
+        b = (a + 1) % nb
+        y = 1.0 / complex(0.02 + 0.005 * a, 0.06 + 0.01 * a)
+        Y[a, a] += y + 0.01j
+        Y[b, b] += y
+        Y[a, b] -= y
+        Y[b, a] -= y
+
+    Vm_t = np.array([1.04, 1.03, 1.02] + [0.99 - 0.004 * k
+                                          for k in range(nb - 3)])
+    Va_t = np.array([0.0] + [-0.02 * (k + 1) for k in range(nb - 1)])
+
+    G, B = Y.real, Y.imag
+    th = Va_t[:, None] - Va_t[None, :]
+    P_t = Vm_t * ((Vm_t[None, :] * (G * np.cos(th) + B * np.sin(th))).sum(1))
+    Q_t = Vm_t * ((Vm_t[None, :] * (G * np.sin(th) - B * np.cos(th))).sum(1))
+
+    m = Model()
+    m.Vm = Var('Vm', np.ones(nb))
+    m.Va = Var('Va', np.zeros(nb))
+    m.Gbus = Param('Gbus', csc_array(G), dim=2, sparse=True)
+    m.Bbus = Param('Bbus', csc_array(B), dim=2, sparse=True)
+    m.Pg = Param('Pg', P_t)
+    m.Qg = Param('Qg', Q_t)
+    m.Pd = Param('Pd', np.zeros(nb))
+    m.Qd = Param('Qd', np.zeros(nb))
+    m.Vm_pinned = Param('Vm_pinned', Vm_t[ref_pv_arr])
+    m.Va_pinned = Param('Va_pinned', Va_t[ref_arr])
+
+    m.Bus = Set('Bus', nb)
+    m.PVPQ = Set('PVPQ', pv_pq_arr)
+    m.PQ = Set('PQ', pq_arr)
+    m.RefPV = Set('RefPV', ref_pv_arr)
+    m.Ref = Set('Ref', ref_arr)
+
+    i_p = m.PVPQ.idx('i_p')
+    i_q = m.PQ.idx('i_q')
+    j = m.Bus.idx('j')
+
+    body_P = (
+        m.Vm[i_p] * Sum(m.Vm[j] * m.Gbus[i_p, j]
+                        * cos(m.Va[i_p] - m.Va[j]), j)
+        + m.Vm[i_p] * Sum(m.Vm[j] * m.Bbus[i_p, j]
+                          * sin(m.Va[i_p] - m.Va[j]), j)
+        + m.Pd[i_p] - m.Pg[i_p]
+    )
+    m.P_eqn = LoopEqn('P_eqn', outer_index=i_p, body=body_P, model=m)
+
+    body_Q = (
+        m.Vm[i_q] * Sum(m.Vm[j] * m.Gbus[i_q, j]
+                        * sin(m.Va[i_q] - m.Va[j]), j)
+        - m.Vm[i_q] * Sum(m.Vm[j] * m.Bbus[i_q, j]
+                          * cos(m.Va[i_q] - m.Va[j]), j)
+        + m.Qd[i_q] - m.Qg[i_q]
+    )
+    m.Q_eqn = LoopEqn('Q_eqn', outer_index=i_q, body=body_Q, model=m)
+
+    i_vp = m.RefPV.idx('i_vp')
+    i_vr = m.Ref.idx('i_vr')
+    m.Vm_pin = LoopEqn('Vm_pin', outer_index=i_vp,
+                       body=m.Vm[i_vp] - m.Vm_pinned[i_vp], model=m)
+    m.Va_pin = LoopEqn('Va_pin', outer_index=i_vr,
+                       body=m.Va[i_vr] - m.Va_pinned[i_vr], model=m)
+    return m, Vm_t, Va_t
+
+
+def test_loop_eqn_polar_pf_set_jacobian_is_exact():
+    """Regression for the ``Set`` / ``SetIdx`` / ``Sum`` interaction that
+    broke SolUtil's polar power flow on the cookbook CI.
+
+    The symptom there was a ``dense fallback triggered for 8x9 block``
+    warning followed by a Newton divergence to ``max|F| = 6e20`` with no
+    NaN anywhere — a finite but WRONG Jacobian, not merely an
+    over-reserved one. The cause was a ``KroneckerDelta`` that names a
+    ``Sum``'s bound dummy being left outside that ``Sum``, because the
+    delta's index and the limit's index had stopped comparing equal.
+
+    Four assertions, ordered so the first one to fail names the defect:
+
+    1. no dense-fallback warning while the derivatives are derived;
+    2. every canonical expression passes ``_assert_canonical_sane``;
+    3. the assembled ``J`` matches a central-difference Jacobian;
+    4. Newton recovers the operating point the injections were built from.
+    """
+    m, Vm_t, Va_t = _polar_pf_model(nb=6)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        spf, y0 = m.create_instance()
+    fallback = [str(w.message) for w in caught
+                if 'dense fallback' in str(w.message)]
+    assert not fallback, (
+        "compute_loop_jac_sparsity gave up on an exactly-classifiable "
+        "block: " + " | ".join(fallback)
+    )
+
+    for eqn_name in ('P_eqn', 'Q_eqn'):
+        eqn = getattr(m, eqn_name)
+        for var_name, ed in eqn.derivatives.items():
+            canonical = getattr(ed, 'canonical', None)
+            if canonical is not None:
+                _assert_canonical_sane(f'{eqn_name} d/d{var_name}',
+                                       canonical)
+
+    mdl, y = _mdl_from_module(spf, y0, jit=False)
+
+    from Solverz import Vars
+
+    y_probe = Vars(y.a, y.array.copy())
+    y_probe['Vm'] = Vm_t + 0.01
+    y_probe['Va'] = Va_t + 0.005
+    J = np.asarray(mdl.J(y_probe, mdl.p).todense())
+
+    n = y_probe.array.size
+    J_fd = np.zeros_like(J)
+    h = 1e-6
+    for c in range(n):
+        yp = Vars(y.a, y_probe.array.copy())
+        ym = Vars(y.a, y_probe.array.copy())
+        yp.array[c] += h
+        ym.array[c] -= h
+        # ``F_`` returns a reused output buffer, so both calls must be
+        # copied before they are subtracted or the difference cancels.
+        Fp = np.array(mdl.F(yp, mdl.p), copy=True)
+        Fm = np.array(mdl.F(ym, mdl.p), copy=True)
+        J_fd[:, c] = (Fp - Fm) / (2 * h)
+    np.testing.assert_allclose(J, J_fd, rtol=2e-5, atol=2e-6)
+
+    sol = nr_method(mdl, y)
+    assert sol.stats.succeed, f"Newton failed: {sol.stats}"
+    np.testing.assert_allclose(sol.y['Vm'], Vm_t, atol=1e-8)
+    np.testing.assert_allclose(sol.y['Va'], Va_t, atol=1e-8)
