@@ -192,7 +192,7 @@ expected_J_mat = """def J_(y_, p_):
     c = p_["c"]
     A = p_["A"]
     data = inner_J(_data_, x, y, A_data, A_indices, A_indptr, A_shape0, b, c)
-    return sps.coo_array((data, (row, col)), (3, 3)).tocsc()
+    return _sz_coo2csc(data)
 """
 
 expected_inner_J_mat = """@njit(cache=True)
@@ -343,7 +343,7 @@ expected_J = """def J_(t, y_, p_, y_0):
     pb = p_["pb"].get_v_t(t)
     qb = p_["qb"]
     data = inner_J(_data_, p, q, p_tag_0, q_tag_0, pb, qb)
-    return sps.coo_array((data, (row, col)), (164, 164)).tocsc()
+    return _sz_coo2csc(data)
 """
 
 expected_inner_J = """@njit(cache=True)
@@ -440,7 +440,7 @@ expected_J1 = """def J_(t, y_, p_):
     h = y_[0:1]
     v = y_[1:2]
     data = inner_J(_data_, h, v)
-    return sps.coo_array((data, (row, col)), (2, 2)).tocsc()
+    return _sz_coo2csc(data)
 """
 
 expected_inner_J1 = """@njit(cache=True)
