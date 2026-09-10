@@ -36,6 +36,7 @@ module.
 """
 from __future__ import annotations
 
+import warnings
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -44,6 +45,72 @@ from sympy.functions.special.tensor_functions import KroneckerDelta
 
 from Solverz.sym_algebra.symbols import Para
 from Solverz.utilities.type_checker import is_zero
+
+
+def check_canonical_invariants(canonical: sp.Expr,
+                                eqn_name: str = '',
+                                var_name: str = '') -> List[str]:
+    """Report the two states of a canonical Jacobian expression that
+    always mean a defect upstream, and that both produce a silently
+    WRONG Jacobian rather than a slow one.
+
+    1. **Two free symbols share a printed name.** Two index objects
+       with the same label are the same index. Carrying both means
+       some part of the pipeline rebuilt one of them into an object
+       that no longer compares equal to the other, so every structural
+       test downstream, ``_canonicalize_sum`` and
+       ``compute_loop_jac_sparsity`` alike, matches only one of the two
+       and silently misclassifies the term. ``Set.idx`` returning a
+       ``SetIdx`` rather than a plain ``sp.Idx`` is what makes this
+       state reachable, since a ``SetIdx`` and an ``sp.Idx`` of the
+       same label and bounds compare unequal by design (issue #161).
+
+    2. **A ``Sum`` dummy is free.** A bound dummy that appears in
+       ``free_symbols`` has escaped its ``Sum``: a factor naming it was
+       lifted out. This is the stale-reference hazard
+       :func:`_canonicalize_sum` guards against at its ``dummy in
+       f.free_symbols`` test, and the generated kernel then reads
+       whatever value the loop variable last held.
+
+    Returns the list of problem descriptions, empty when the
+    expression is sound. Callers warn rather than raise, so a model
+    that hits this still runs and can be compared against a
+    finite-difference Jacobian.
+    """
+    problems: List[str] = []
+
+    by_label: Dict[str, list] = {}
+    for sym in canonical.free_symbols:
+        by_label.setdefault(str(sym), []).append(sym)
+    for label, objs in sorted(by_label.items()):
+        if len(objs) > 1:
+            detail = " vs ".join(
+                f"{type(o).__name__}{tuple(o.args)}" for o in objs)
+            problems.append(
+                f"index label {label!r} is carried by "
+                f"{len(objs)} unequal objects: {detail}")
+
+    free_labels = {str(sym) for sym in canonical.free_symbols}
+    for node in canonical.atoms(sp.Sum):
+        for dummy in node.variables:
+            if str(dummy) in free_labels:
+                problems.append(
+                    f"Sum dummy {str(dummy)!r} "
+                    f"({type(dummy).__name__}{tuple(dummy.args)}) is also "
+                    f"free, so a factor naming it was lifted out of "
+                    f"Sum(..., {tuple(node.limits[0])})")
+
+    if problems:
+        where = ' '.join(x for x in (eqn_name, var_name) if x)
+        warnings.warn(
+            "LoopEqn canonical Jacobian is structurally unsound"
+            + (f" for {where}" if where else "")
+            + ". The generated Jacobian will be wrong, not merely "
+              "over-reserved. "
+            + "; ".join(problems)
+            + f". Canonical: {canonical}",
+            stacklevel=3)
+    return problems
 
 
 def canonicalize_kronecker(expr: sp.Expr,
@@ -98,8 +165,10 @@ def canonicalize_kronecker(expr: sp.Expr,
         # f'(a-b) * (∂a/∂x - ∂b/∂x)`` with both partial derivatives
         # being ``KroneckerDelta``s.
         expr = sp.expand_mul(expr)
-        return canonicalize_kronecker(expr, outer_idx, diff_idx,
-                                      _expanded=True)
+        out = canonicalize_kronecker(expr, outer_idx, diff_idx,
+                                     _expanded=True)
+        check_canonical_invariants(out)
+        return out
     if isinstance(expr, sp.Add):
         return sp.Add(*(
             canonicalize_kronecker(a, outer_idx, diff_idx,
