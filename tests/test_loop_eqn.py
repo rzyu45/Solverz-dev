@@ -2992,48 +2992,22 @@ def test_loop_eqn_walker_above_one_megabyte_is_cached_by_numba(tmp_path):
             del sys.modules[k]
 
 
-def _sum_dummies(expr):
-    """Every bound dummy of every ``Sum`` inside ``expr``."""
-    return {d for node in expr.atoms(sp.Sum) for d in node.variables}
-
-
 def _assert_canonical_sane(name, canonical):
-    """Two structural invariants every canonical Jacobian expression must
-    hold, both of which produce a silently WRONG Jacobian when violated.
-
-    1. No two free symbols share a printed name. Two index objects with
-       the same label are the same index; carrying both means some part
-       of the pipeline rebuilt one of them and the two no longer compare
-       equal, so every structural test downstream picks the wrong one.
-    2. No ``Sum`` dummy is free. A bound dummy that appears in
-       ``free_symbols`` has escaped its ``Sum`` — the stale-reference
-       hazard ``_canonicalize_sum`` guards against — and the generated
-       kernel then reads whatever value the loop variable last held.
+    """Delegate to the production invariant check so the test and the
+    library can never drift apart. See
+    ``Solverz.equation.loop_jac.check_canonical_invariants`` for what the
+    two invariants are and why violating either yields a Jacobian that is
+    wrong rather than merely over-reserved.
     """
-    free = list(canonical.free_symbols)
-    by_label = {}
-    for s in free:
-        by_label.setdefault(str(s), []).append(s)
-    dupes = {lab: objs for lab, objs in by_label.items() if len(objs) > 1}
-    assert not dupes, (
-        f"{name}: {len(dupes)} label(s) carried by more than one object: "
-        + "; ".join(
-            f"{lab!r} -> " + " vs ".join(
-                f"{type(o).__name__}{o.args}" for o in objs)
-            for lab, objs in dupes.items()
-        )
-    )
+    from Solverz.equation.loop_jac import check_canonical_invariants
 
-    free_labels = {str(s) for s in free}
-    escaped = sorted(str(d) for d in _sum_dummies(canonical)
-                     if str(d) in free_labels)
-    assert not escaped, (
-        f"{name}: Sum dummy {escaped} appears free — a factor referencing "
-        f"it was lifted out of its Sum. Canonical: {canonical}"
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        problems = check_canonical_invariants(canonical)
+    assert not problems, f"{name}: " + "; ".join(problems)
 
 
-def _polar_pf_model(nb=6, jit=False):
+def _polar_pf_model(nb=6, mismatch_dummy=False):
     """A model with the exact shape of SolUtil's polar power flow.
 
     Four ``Set``s of three different kinds meet in one model, which is
@@ -3049,6 +3023,12 @@ def _polar_pf_model(nb=6, jit=False):
 
     Injections are back-solved from a chosen operating point, so the
     Newton solve from a flat start must recover it exactly.
+
+    With ``mismatch_dummy`` the ``Sum`` limits carry a plain
+    ``sp.Idx('j', nb)`` while the ``Sum`` bodies keep the ``SetIdx``
+    from ``Bus``. The two have the same label and the same bounds and
+    compare unequal, which is the state the cookbook CI reaches and
+    which every structural test in ``loop_jac`` must tolerate.
     """
     from Solverz import Set
 
@@ -3100,21 +3080,28 @@ def _polar_pf_model(nb=6, jit=False):
     i_p = m.PVPQ.idx('i_p')
     i_q = m.PQ.idx('i_q')
     j = m.Bus.idx('j')
+    # The limit index and the body index are the same object unless the
+    # caller asks for the mismatch.
+    j_lim = sp.Idx('j', nb) if mismatch_dummy else j
+
+    def walk(idx, P):
+        return Sum(m.Vm[j] * P[idx, j] * cos(m.Va[idx] - m.Va[j]),
+                   (j_lim, 0, nb - 1))
+
+    def walk_s(idx, P):
+        return Sum(m.Vm[j] * P[idx, j] * sin(m.Va[idx] - m.Va[j]),
+                   (j_lim, 0, nb - 1))
 
     body_P = (
-        m.Vm[i_p] * Sum(m.Vm[j] * m.Gbus[i_p, j]
-                        * cos(m.Va[i_p] - m.Va[j]), j)
-        + m.Vm[i_p] * Sum(m.Vm[j] * m.Bbus[i_p, j]
-                          * sin(m.Va[i_p] - m.Va[j]), j)
+        m.Vm[i_p] * walk(i_p, m.Gbus)
+        + m.Vm[i_p] * walk_s(i_p, m.Bbus)
         + m.Pd[i_p] - m.Pg[i_p]
     )
     m.P_eqn = LoopEqn('P_eqn', outer_index=i_p, body=body_P, model=m)
 
     body_Q = (
-        m.Vm[i_q] * Sum(m.Vm[j] * m.Gbus[i_q, j]
-                        * sin(m.Va[i_q] - m.Va[j]), j)
-        - m.Vm[i_q] * Sum(m.Vm[j] * m.Bbus[i_q, j]
-                          * cos(m.Va[i_q] - m.Va[j]), j)
+        m.Vm[i_q] * walk_s(i_q, m.Gbus)
+        - m.Vm[i_q] * walk(i_q, m.Bbus)
         + m.Qd[i_q] - m.Qg[i_q]
     )
     m.Q_eqn = LoopEqn('Q_eqn', outer_index=i_q, body=body_Q, model=m)
@@ -3194,3 +3181,115 @@ def test_loop_eqn_polar_pf_set_jacobian_is_exact():
     assert sol.stats.succeed, f"Newton failed: {sol.stats}"
     np.testing.assert_allclose(sol.y['Vm'], Vm_t, atol=1e-8)
     np.testing.assert_allclose(sol.y['Va'], Va_t, atol=1e-8)
+
+
+def test_loop_eqn_polar_pf_survives_a_mismatched_sum_dummy_object():
+    """The same model, built so the ``Sum`` limit index and the ``Sum``
+    body index are two objects of one label.
+
+    This is the state the cookbook CI reaches, reproduced deliberately
+    rather than waited for. ``Set.idx`` returns a ``SetIdx`` carrying
+    its set's token as a third argument, so it compares unequal to a
+    plain ``sp.Idx`` of the same label and bounds, by design for issue
+    161. Every structural test in ``loop_jac`` compares indices by
+    label through ``_name_of``, except for a handful that used raw
+    SymPy equality; where the two policies disagree,
+    ``_canonicalize_sum`` fails to match the ``KroneckerDelta`` against
+    the dummy, lifts it out of the ``Sum`` it belongs to, and leaves it
+    naming a bound variable. The generated Jacobian is then finite and
+    wrong, and Newton diverges without a single NaN.
+
+    The same four assertions as the well-formed case must hold, and the
+    Jacobian must still match a central difference.
+    """
+    m, Vm_t, Va_t = _polar_pf_model(nb=6, mismatch_dummy=True)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        spf, y0 = m.create_instance()
+    bad = [str(w.message) for w in caught
+           if 'dense fallback' in str(w.message)
+           or 'structurally unsound' in str(w.message)]
+    assert not bad, " | ".join(bad)
+
+    for eqn_name in ('P_eqn', 'Q_eqn'):
+        eqn = getattr(m, eqn_name)
+        for var_name, ed in eqn.derivatives.items():
+            canonical = getattr(ed, 'canonical', None)
+            if canonical is not None:
+                _assert_canonical_sane(f'{eqn_name} d/d{var_name}',
+                                       canonical)
+
+    from Solverz import Vars
+
+    mdl, y = _mdl_from_module(spf, y0, jit=False)
+    y_probe = Vars(y.a, y.array.copy())
+    y_probe['Vm'] = Vm_t + 0.01
+    y_probe['Va'] = Va_t + 0.005
+    J = np.asarray(mdl.J(y_probe, mdl.p).todense())
+
+    J_fd = np.zeros_like(J)
+    h = 1e-6
+    for c in range(y_probe.array.size):
+        yp = Vars(y.a, y_probe.array.copy())
+        ym = Vars(y.a, y_probe.array.copy())
+        yp.array[c] += h
+        ym.array[c] -= h
+        Fp = np.array(mdl.F(yp, mdl.p), copy=True)
+        Fm = np.array(mdl.F(ym, mdl.p), copy=True)
+        J_fd[:, c] = (Fp - Fm) / (2 * h)
+    np.testing.assert_allclose(J, J_fd, rtol=2e-5, atol=2e-6)
+
+    sol = nr_method(mdl, y)
+    assert sol.stats.succeed, f"Newton failed: {sol.stats}"
+    np.testing.assert_allclose(sol.y['Vm'], Vm_t, atol=1e-8)
+    np.testing.assert_allclose(sol.y['Va'], Va_t, atol=1e-8)
+
+
+def test_check_canonical_invariants_reports_a_lifted_delta():
+    """The guard must speak on the two states it exists for, and stay
+    silent on the shapes a sound canonicalisation legitimately produces.
+
+    A ``KroneckerDelta`` naming a ``Sum``'s dummy from OUTSIDE that
+    ``Sum`` is the shape the cookbook CI produced. It is not a slow
+    Jacobian, it is a wrong one, and nothing downstream notices, so this
+    is the only place it can be caught. The delta that names the OUTER
+    index rather than the dummy is the legitimate pulled-out form and
+    must not be reported.
+    """
+    from sympy.functions.special.tensor_functions import KroneckerDelta
+
+    from Solverz.equation.loop_jac import check_canonical_invariants
+
+    k = sp.Idx('_sz_loop_dk')
+    i = sp.Idx('i', 6)
+    j = sp.Idx('j', 6)
+    f = sp.IndexedBase('f')
+
+    sound = KroneckerDelta(k, i) * sp.Sum(f[j], (j, 0, 5))
+    assert check_canonical_invariants(sound) == []
+
+    lifted = KroneckerDelta(k, j) * sp.Sum(f[j], (j, 0, 5))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        problems = check_canonical_invariants(lifted, 'eqn', 'x')
+    assert len(problems) == 1
+    assert 'occurs outside every Sum' in problems[0]
+    assert any('structurally unsound' in str(w.message) for w in caught)
+
+    # Two objects of one label. Built the way Set.idx makes reachable:
+    # a SetIdx and a plain Idx of the same name and bounds.
+    from Solverz.equation.eqn import IndexSet
+
+    j_set = IndexSet('S', 6).idx('j')
+    twins = f[j_set] + f[j]
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        problems = check_canonical_invariants(twins)
+    # The twin index and every Indexed built on it are both reported,
+    # which is the pattern the cookbook CI showed: i_p twice and
+    # PVPQ[i_p] twice in one expression.
+    idx_problem = [x for x in problems if x.startswith("index label 'j'")]
+    assert len(idx_problem) == 1
+    assert 'SetIdx' in idx_problem[0] and 'Idx(' in idx_problem[0]
+    assert any(x.startswith("index label 'f[j]'") for x in problems)

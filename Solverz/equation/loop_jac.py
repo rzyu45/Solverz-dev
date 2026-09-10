@@ -47,6 +47,43 @@ from Solverz.sym_algebra.symbols import Para
 from Solverz.utilities.type_checker import is_zero
 
 
+def _index_matches(expr, idx) -> bool:
+    """True when ``expr`` is the index ``idx``, compared by label.
+
+    Every other structural test in this module compares indices through
+    :func:`_name_of`, that is, by label. These few sites used raw SymPy
+    equality instead, and the two policies agreed only for as long as
+    ``Set.idx`` returned a plain ``sp.Idx``, which SymPy interns, so two
+    indices of one label were one object. ``Set.idx`` now returns a
+    ``SetIdx`` carrying its set's token as a third argument, so a
+    ``SetIdx`` and an ``sp.Idx`` of the same label and bounds compare
+    unequal by design (issue #161) and the two policies can disagree.
+    Where they disagree the analyzer produces a WRONG Jacobian rather
+    than a slow one, because a ``KroneckerDelta`` on a ``Sum`` dummy
+    that fails to match is lifted out of its ``Sum`` and left naming a
+    bound variable.
+
+    Comparing labels is safe here and does not reopen issue #161. This
+    module only ever compares indices WITHIN one equation body, where
+    two indices of one label are the same index; a body that carries two
+    is malformed and :func:`check_canonical_invariants` reports it. What
+    issue #161 fixed is a different question, whether an index belongs
+    to a given ``Set``, and ``_lookup_index_set`` still answers that from
+    the token.
+    """
+    return isinstance(expr, sp.Idx) and _name_of(expr) == _name_of(idx)
+
+
+def _references_index(expr, idx) -> bool:
+    """True when the index ``idx`` occurs anywhere in ``expr``, compared
+    by label. See :func:`_index_matches` for why the comparison is by
+    label rather than by SymPy equality.
+    """
+    name = _name_of(idx)
+    return any(isinstance(sym, sp.Idx) and _name_of(sym) == name
+               for sym in expr.free_symbols)
+
+
 def check_canonical_invariants(canonical: sp.Expr,
                                 eqn_name: str = '',
                                 var_name: str = '') -> List[str]:
@@ -90,15 +127,28 @@ def check_canonical_invariants(canonical: sp.Expr,
                 f"index label {label!r} is carried by "
                 f"{len(objs)} unequal objects: {detail}")
 
-    free_labels = {str(sym) for sym in canonical.free_symbols}
-    for node in canonical.atoms(sp.Sum):
-        for dummy in node.variables:
-            if str(dummy) in free_labels:
-                problems.append(
-                    f"Sum dummy {str(dummy)!r} "
-                    f"({type(dummy).__name__}{tuple(dummy.args)}) is also "
-                    f"free, so a factor naming it was lifted out of "
-                    f"Sum(..., {tuple(node.limits[0])})")
+    # Blank every Sum out of the expression, then ask whether a dummy
+    # label still occurs. What remains is what sits OUTSIDE every Sum, so
+    # a hit is a factor that was lifted out of the Sum it belongs to and
+    # left naming a bound variable. Compare by label, not by SymPy
+    # equality, for the reason given in :func:`_index_matches`: an index
+    # inside the body and the one in the limit may be two objects, and it
+    # is precisely then that this check has to work.
+    sums = canonical.atoms(sp.Sum)
+    if sums:
+        blanked = canonical.xreplace(
+            {node: sp.Symbol('_sz_blanked_sum') for node in sums})
+        outside = {_name_of(sym) for sym in blanked.free_symbols
+                   if isinstance(sym, sp.Idx)}
+        for node in sums:
+            for dummy in node.variables:
+                if _name_of(dummy) in outside:
+                    problems.append(
+                        f"Sum dummy {_name_of(dummy)!r} "
+                        f"({type(dummy).__name__}{tuple(dummy.args)}) also "
+                        f"occurs outside every Sum, so a factor naming it "
+                        f"was lifted out of "
+                        f"Sum(..., {tuple(node.limits[0])})")
 
     if problems:
         where = ' '.join(x for x in (eqn_name, var_name) if x)
@@ -236,7 +286,7 @@ def _canonicalize_sum(sum_node: sp.Sum,
             a, b = f.args
             # KroneckerDelta is symmetric: δ(a,b) = δ(b,a). Either
             # side may be the dummy.
-            if a == dummy or b == dummy:
+            if _index_matches(a, dummy) or _index_matches(b, dummy):
                 if dummy_collapse is not None:
                     # Two deltas on the same dummy in one Mul —
                     # unusual; would imply the other args must be
@@ -247,7 +297,7 @@ def _canonicalize_sum(sum_node: sp.Sum,
                         f"KroneckerDelta factors on sum dummy "
                         f"{dummy!r} in {body}"
                     )
-                other_side = b if a == dummy else a
+                other_side = b if _index_matches(a, dummy) else a
                 dummy_collapse = (dummy, other_side)
             else:
                 # Only pull the delta out if it doesn't reference the
@@ -258,7 +308,7 @@ def _canonicalize_sum(sum_node: sp.Sum,
                 # Pulling such a delta out of the Sum creates a stale
                 # reference to ``p_p`` that incorrectly evaluates to
                 # the last loop-iteration value in generated code.
-                if dummy in f.free_symbols:
+                if _references_index(f, dummy):
                     other_factors.append(f)
                 else:
                     pulled_deltas.append(f)
@@ -272,7 +322,15 @@ def _canonicalize_sum(sum_node: sp.Sum,
         # Dummy → other_side in the remaining body, drop the Sum +
         # the matched delta.
         dummy_sym, replacement = dummy_collapse
-        collapsed = remaining_body.subs(dummy_sym, replacement)
+        # ``subs`` compares by SymPy equality, so it would miss an
+        # occurrence of the dummy that is a different object carrying the
+        # same label — the same asymmetry :func:`_index_matches` exists
+        # for. Build the replacement map from the objects the body
+        # actually holds, so every occurrence goes whatever its identity.
+        targets = {sym: replacement for sym in remaining_body.free_symbols
+                   if _index_matches(sym, dummy_sym)}
+        collapsed = (remaining_body.xreplace(targets) if targets
+                     else remaining_body)
         # Re-multiply any other (pulled) deltas.
         for d in pulled_deltas:
             collapsed = collapsed * d
@@ -1795,7 +1853,7 @@ def compute_loop_jac_sparsity(canonical: sp.Expr,
                     other = a1 if diff_side == 0 else a0
                     other_kind = kind1 if diff_side == 0 else kind0
                     if (other_kind is None
-                            and outer_idx in other.free_symbols):
+                            and _references_index(other, outer_idx)):
                         entries = _probe_kron_entries(
                             other, outer_idx, n_outer, n_diff)
                         if entries is not None:
@@ -1953,8 +2011,7 @@ def compute_loop_jac_sparsity(canonical: sp.Expr,
                     if len(sarg_m.indices) != 1:
                         continue
                     sinner = sarg_m.indices[0]
-                    if not (isinstance(sinner, sp.Idx)
-                            and sinner == sdummy):
+                    if not _index_matches(sinner, sdummy):
                         continue
                     mname = sarg_m.base.name
                     mobj = var_map.get(mname)
@@ -1984,9 +2041,9 @@ def compute_loop_jac_sparsity(canonical: sp.Expr,
                 sax0, sax1 = sf.indices
                 # One axis must be the Sum dummy, the other the
                 # outer index (possibly indirect).
-                if sax1 == sdummy:
+                if _index_matches(sax1, sdummy):
                     kind_row, map_row = _classify_axis(sax0)
-                elif sax0 == sdummy:
+                elif _index_matches(sax0, sdummy):
                     kind_row, map_row = _classify_axis(sax1)
                 else:
                     continue
