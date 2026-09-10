@@ -45,7 +45,9 @@ m.balance = LoopEqn(
 The generated module contains **one** `inner_F<N>` with an explicit
 `for i in range(nb):` inside. One LLVM compilation instead of `nb`.
 On the full 8996-DOF "Big" IES benchmark the cold-cache wall shrinks
-from ≈300 s to ≈150 s — see [#134](https://github.com/smallbunnies/Solverz/issues/134)
+from ≈300 s to ≈150 s, measured in benchmark run 1 of
+[#134](https://github.com/smallbunnies/Solverz/issues/134) and not
+re-measured since — see that issue
 for the measured table.
 
 ## 2. Hello `LoopEqn`
@@ -244,7 +246,12 @@ canonical example of how `LoopEqn` / `LoopOde` scale to a
 production model. On the 8996-DOF Big system, using `loopeqn=True`
 makes the full Rodas run **3.6× faster** than the scalar-`Eqn`
 expansion, measured end-to-end (see the `bench` script alongside the
-test).
+test). That figure is from benchmark run 1 of
+[#134](https://github.com/smallbunnies/Solverz/issues/134) and was not
+re-measured for 0.11.0. Whether `LoopEqn` wins end to end depends on how
+much of the wall time is Jacobian work: on the smaller Cookbook IES,
+whose Rodas run is dominated by residual evaluations, the scalar-`Eqn`
+path is the faster of the two.
 
 ## 7. `LoopOde`: the `LoopEqn` of time derivatives
 
@@ -283,15 +290,17 @@ module_printer(spf, y0, name='my_model',
 
 ## 9. Performance expectations
 
-From `Solverz-Cookbook/docs/source/ae/pf/src/bench_loopeqn_pf.py`
-on case30 (29-bus polar PF, 53 residuals):
+From `Solverz-Cookbook/docs/source/ae/pf/src/bench_pf_loopeqn_vs_polar.py`
+on case30 (30-bus polar PF), measured on Solverz 0.11.0. The Cookbook's
+power-flow chapter quotes the same run, so the two cannot drift apart:
 
 | metric | `loopeqn=False` | `loopeqn=True` | ratio |
 |---|---:|---:|---:|
-| Cold Numba compile | 45 s | 1.2 s | **38× faster** |
-| `@njit` sub-functions | 54 F + 362 J | 4 F + 1 J | **416 → 5** |
-| Hot F eval | 1.11 µs | 2.49 µs | 2.2× slower |
-| Hot J eval | 52.8 µs | 37.2 µs | **1.4× faster** |
+| Cold Numba compile | 49 s | 2.9 s | **17× faster** |
+| `@njit` sub-functions | 416 | 12 | **35× fewer** |
+| Hot F eval | 1.28 µs | 3.73 µs | 2.9× slower |
+| Hot J eval | 41.1 µs | 23.5 µs | **1.8× faster** |
+| Newton-Raphson end to end | 0.29 ms | 0.16 ms | **1.8× faster** |
 
 The warmup wins are structural — you get them for any LoopEqn
 model. The F / J per-call ratios depend on the body shape. Bodies
