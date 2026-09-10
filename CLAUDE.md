@@ -86,8 +86,25 @@ the tagged commit via git URL).
   against the new Solverz — this passes if there is no breaking
   Solverz API change, fails if there is.
 
+- SolMuseum declares an upper cap on Solverz, currently
+  `Solverz>=0.10.0,<0.12`. **If the new Solverz version crosses that
+  cap, SolMuseum must be released FIRST**, with the cap widened,
+  which reverses the order below. The reason is that
+  `tests_in_cookbook` installs the tagged Solverz by git URL and then
+  runs `uv pip install SolMuseum` with dependencies, so a Solverz the
+  cap excludes is uninstalled and the newest admitted release is put
+  back over it. The gate then reports on a Solverz that is not the one
+  being released. Check before tagging with a 0.X.Y wheel built by
+  `SETUPTOOLS_SCM_PRETEND_VERSION=0.X.Y uv build --wheel`, installed
+  into a scratch venv, then `uv pip install --dry-run SolMuseum`: if
+  the plan contains a `- solverz==0.X.Y` line, widen the cap and
+  release SolMuseum first. Widen the **cap only** — raising SolMuseum's
+  floor to the unpublished version deadlocks its own CI, which installs
+  Solverz from PyPI.
+
 **Release the upstream first, then cascade.** Do not try to merge
-or tag all three at once — cross-repo CI will deadlock.
+or tag all three at once — cross-repo CI will deadlock. The one
+exception is the SolMuseum cap above.
 
 #### Phase 0 — Preparation
 
@@ -108,24 +125,34 @@ or tag all three at once — cross-repo CI will deadlock.
 
 #### Phase 1 — Solverz release
 
-1. `cd Solverz-dev && git checkout main && git pull --ff-only`.
-2. Merge the Solverz PR to `main` (squash or merge-commit). Admin
-   merge is acceptable if cross-repo CI is red solely because
-   downstream PRs haven't landed yet. Confirm the merge is
-   backward-compatible for SolMuseum's current `main` before
+**Tags go to `upstream`, never to `origin`.** In this working copy
+`origin` is the fork `rzyu45/Solverz-dev`, which carries no release
+tags at all; every published tag lives on `smallbunnies/Solverz`.
+Pushing the tag to `origin` runs the workflow with
+`github.repository == rzyu45/Solverz-dev`, so it publishes from the
+wrong repository. The same applies to the fork's `main`, which is
+stale — do not check it out for a release.
+
+1. Merge the Solverz PR to `smallbunnies/Solverz:main` (squash or
+   merge-commit). Admin merge is acceptable if cross-repo CI is red
+   solely because downstream PRs haven't landed yet. Confirm the merge
+   is backward-compatible for SolMuseum's current `main` before
    overriding.
-3. `git pull --ff-only` to fetch the merge commit.
-4. Annotate-tag: `git tag -a 0.X.Y -m "Release 0.X.Y"`.
-5. `git push origin 0.X.Y`. This triggers the tag-push CI:
+2. `git fetch upstream` and check the merge commit out detached:
+   `git checkout upstream/main`.
+3. Annotate-tag: `git tag -a 0.X.Y -m "Release 0.X.Y"`.
+4. `git push upstream 0.X.Y`. This triggers the tag-push CI:
    `built_in_tests` → `tests_in_museum` / `tests_in_cookbook` →
    `build` → `publish-to-pypi` → `github-release`.
-6. If `tests_in_museum` / `tests_in_cookbook` fail due to flaky /
+5. If `tests_in_museum` / `tests_in_cookbook` fail due to flaky /
    tolerance / environmental issues (not real API break), use
    `gh run rerun <id> --failed` to retry. If they fail for a real
-   reason, delete the tag (`git push --delete origin 0.X.Y`) and
+   reason, delete the tag (`git push --delete upstream 0.X.Y`) and
    investigate — do not bypass the gate.
-7. Verify PyPI: `pip index versions Solverz` reports `0.X.Y`. Wait
+6. Verify PyPI: `pip index versions Solverz` reports `0.X.Y`. Wait
    1–3 min for CDN propagation before starting Phase 2.
+7. Merge `upstream/main` back into the fork's `dev` so `dev` never
+   falls behind.
 
 #### Phase 2 — SolMuseum release
 
