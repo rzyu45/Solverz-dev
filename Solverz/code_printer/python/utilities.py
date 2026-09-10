@@ -269,8 +269,8 @@ def print_eqn_assignment(EQNs: Dict[str, Eqn],
             # LoopEqns, this is a no-op (``njit_arg_names`` falls back
             # to all SYMBOLS).
             if isinstance(eqn, LoopEqn):
-                call_args = [eqn.SYMBOLS[nm]
-                             for nm in eqn.njit_arg_names()]
+                call_args = ([eqn.SYMBOLS[nm] for nm in eqn.njit_arg_names()]
+                             + [symbols(w, real=True) for w in eqn.walker_arg_names()])
             else:
                 call_args = list(eqn.SYMBOLS.values())
             eqn_declaration.append(Assignment(_F_[eqn_address],

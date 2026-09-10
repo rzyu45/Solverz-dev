@@ -3230,3 +3230,66 @@ def test_check_canonical_invariants_reports_a_lifted_delta():
     assert len(idx_problem) == 1
     assert 'SetIdx' in idx_problem[0] and 'Idx(' in idx_problem[0]
     assert any(x.startswith("index label 'f[j]'") for x in problems)
+
+
+def test_loop_eqn_walker_above_one_megabyte_is_cached_by_numba(tmp_path):
+    """The CSR arrays of a sparse walker and the row / column arrays of a
+    loop Jacobian kernel reach the compiled functions as arguments, so
+    Numba caches them even when they exceed its 1 MB limit for frozen
+    global arrays (issue #162)."""
+    import importlib
+    import os
+    import re
+    import sys
+    import warnings
+
+    from scipy.sparse import random as sp_random, eye as sp_eye
+    from Solverz import LoopEqn, module_printer
+
+    n = 20000
+    rng = np.random.default_rng(0)
+    G = csc_array(sp_random(n, n, density=150000 / n ** 2, format='csc', random_state=rng) + sp_eye(n) * 0.5)
+    assert G.data.nbytes > 10 ** 6
+
+    m = Model()
+    m.x = Var('x', np.ones(n))
+    m.G = Param('G', G, dim=2, sparse=True)
+    m.b = Param('b', np.ones(n))
+    i, j = sp.Idx('i'), sp.Idx('j')
+    xs, Gs, bs = sp.IndexedBase('x'), sp.IndexedBase('G'), sp.IndexedBase('b')
+    # sin(G x) keeps the Jacobian a loop kernel that reads G by point lookup
+    m.eqn = LoopEqn('eqn', outer_index=i, n_outer=n,
+                    body=bs[i] - sp.Sum(sp.sin(Gs[i, j] * xs[j]), (j, 0, n - 1)),
+                    var_map={'x': m.x, 'G': m.G, 'b': m.b})
+    spf, y0 = m.create_instance()
+    name = 'sz_test_big_walker'
+    module_printer(spf, y0, name, directory=str(tmp_path), jit=True).render()
+    src = (tmp_path / name / 'num_func.py').read_text()
+    walkers = '_sz_csr_G_data, _sz_csr_G_indices, _sz_csr_G_indptr'
+    assert re.search(rf'def inner_F0\(.*{walkers}\):', src)
+    assert re.search(rf'return inner_F\(_F_, .*{walkers}\)', src)
+    assert re.search(rf'def inner_J\(_data_, .*_sz_loop_jac_row_0, _sz_loop_jac_col_0, {walkers}\):', src)
+    assert re.search(rf'def _sz_csr_G_point\(row, col, {walkers}\):', src)
+    assert re.search(rf'_sz_loop_jac_kernel_0\(.*_sz_loop_jac_row_0, _sz_loop_jac_col_0, {walkers}\)', src)
+    sys.path.insert(0, str(tmp_path))
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            mod = importlib.import_module(name)
+            F = mod.mdl.F(mod.y, mod.mdl.p)
+            J = mod.mdl.J(mod.y, mod.mdl.p)
+        refusals = [str(w.message) for w in caught if 'Cannot cache' in str(w.message)]
+        assert refusals == []
+        sinG = csc_array((np.sin(G.data), G.indices, G.indptr), shape=G.shape)
+        np.testing.assert_allclose(F, 1.0 - np.asarray(sinG.sum(axis=1)).ravel(), atol=1e-12)
+        ref = csc_array((-G.data * np.cos(G.data), G.indices, G.indptr), shape=G.shape)
+        assert abs(J - ref).max() < 1e-12
+        # every compiled function left an index file in its own cache directory
+        num_func = sys.modules[f'{name}.num_func']
+        for fn in ('inner_F0', 'inner_F', 'inner_J', '_sz_loop_jac_kernel_0'):
+            cache_dir = getattr(num_func, fn)._cache._cache_path
+            assert any(f.startswith(f'num_func.{fn}-') and f.endswith('.nbi') for f in os.listdir(cache_dir)), fn
+    finally:
+        sys.path.remove(str(tmp_path))
+        for k in [k for k in sys.modules if k.startswith(name)]:
+            del sys.modules[k]

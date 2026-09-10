@@ -222,6 +222,7 @@ class LoopEqnDiff(EqnDiff):
         # and point-lookup helpers both pull from the CSR arrays,
         # so no kernel arg is needed for the sparse Param itself.
         sym_names: set = set()
+        sparse_names: set = set()   # sparse 2-D Params: CSR arrays enter as trailing args
         for idx_node in canonical.atoms(sp.Indexed):
             base_name = idx_node.base.name
             if base_name not in var_map:
@@ -230,6 +231,7 @@ class LoopEqnDiff(EqnDiff):
             if (isinstance(sol_obj, ParamBase)
                     and getattr(sol_obj, 'sparse', False)
                     and sol_obj.dim == 2):
+                sparse_names.add(base_name)
                 continue
             sym_names.add(base_name)
         for s in canonical.free_symbols:
@@ -263,9 +265,14 @@ class LoopEqnDiff(EqnDiff):
         self._nnz = int(sparsity_row.size)
 
         kernel_name = f'_sz_loop_jac_kernel_{sanitized}'
+        # The CSR arrays of the sparse Params the kernel reads follow the
+        # row and column arrays in its signature (issue #162).
+        self.walker_arg_names = [f'_sz_csr_{nm}_{part}' for nm in sorted(sparse_names)
+                                 for part in ('data', 'indices', 'indptr')]
         self.kernel_source, self.helper_sources = build_loop_jac_kernel_source(
             kernel_name, canonical, outer_idx, diff_idx,
             self._nnz, sorted_symbols, var_map,
+            walker_names=self.walker_arg_names,
         )
 
         # exec the source into a namespace with the numpy + SolCF
@@ -328,9 +335,14 @@ class LoopEqnDiff(EqnDiff):
         _row_arr = self._sparsity_row
         _col_arr = self._sparsity_col
 
+        missing = [nm for nm in self.walker_arg_names if nm not in ns]
+        if missing:
+            raise ValueError(f"LoopEqnDiff {name!r}: the sparse Param behind {missing} has no value")
+        _walker_arrays = tuple(ns[nm] for nm in self.walker_arg_names)
+
         def _kernel_wrapper(*args, _raw=raw_kernel_func,
-                             _r=_row_arr, _c=_col_arr):
-            return _raw(*args, _r, _c)
+                             _r=_row_arr, _c=_col_arr, _w=_walker_arrays):
+            return _raw(*args, _r, _c, *_w)
 
         _kernel_wrapper._kernel_source = self.kernel_source
         kernel_func = _kernel_wrapper
@@ -1477,10 +1489,9 @@ class LoopEqn(Eqn):
 
         Sparse 2-D ``Param``s used as CSR walkers are EXCLUDED — their
         CSR arrays (``_sz_csr_<M>_data`` / ``_sz_csr_<M>_indices`` /
-        ``_sz_csr_<M>_indptr``) are injected as module-level constants
-        via ``mut_mat_mappings`` at render time, and the generated
-        body references them by those fixed names rather than
-        receiving them through the call signature.
+        ``_sz_csr_<M>_indptr``) follow these names in the signature, see
+        :meth:`walker_arg_names`; they are loaded once at module import
+        and handed down by the ``F_`` wrapper.
 
         This matters because scipy ``csc_array`` objects are not
         understood by Numba — the wrapper ``F_`` would have to
@@ -1490,6 +1501,18 @@ class LoopEqn(Eqn):
         """
         return [nm for nm in sorted(self.SYMBOLS.keys())
                 if nm not in self._sparse_csr]
+
+    def walker_arg_names(self) -> List[str]:
+        """The CSR arrays of this LoopEqn's sparse walkers, in the order the
+        generated ``inner_F<N>`` receives them after :meth:`njit_arg_names`:
+        ``_sz_csr_<M>_data``, ``_indices`` and ``_indptr`` for each walker
+        ``M`` in sorted order. They are passed as arguments from the
+        Python-level ``F_`` wrapper rather than read as module-level
+        globals, because Numba treats a global array above 1 MB as a
+        dynamic global and then refuses to cache the kernel (issue #162).
+        """
+        return [f'_sz_csr_{nm}_{part}' for nm in sorted(self._sparse_csr)
+                for part in ('data', 'indices', 'indptr')]
 
     def print_njit_source(self, func_name: str) -> str:
         """Return Numba-compatible Python source for an ``inner_F<N>``
@@ -1523,7 +1546,7 @@ class LoopEqn(Eqn):
         nested Sums; if a real use case appears, the right answer is
         to emit explicit nested ``for`` loops.
         """
-        arg_names = self.njit_arg_names()
+        arg_names = self.njit_arg_names() + self.walker_arg_names()
         outer_name = self.outer_index.name
         n_outer = self.n_outer
 
@@ -2152,7 +2175,10 @@ def _translate_loop_body_njit(expr, state) -> str:
                 state.setdefault('sparse_point_helpers', set()).add(
                     base_name)
                 return (f"_sz_csr_{base_name}_point("
-                        f"{row_code}, {col_code})")
+                        f"{row_code}, {col_code}, "
+                        f"_sz_csr_{base_name}_data, "
+                        f"_sz_csr_{base_name}_indices, "
+                        f"_sz_csr_{base_name}_indptr)")
         index_strs = [_translate_loop_body_njit(idx, state)
                       for idx in expr.indices]
         return f"{base_name}[{', '.join(index_strs)}]"
