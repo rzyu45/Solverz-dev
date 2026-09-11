@@ -194,9 +194,10 @@ class LoopEqnDiff(EqnDiff):
        ``is_constant_matrix_deri`` returns False → JacBlock marks
        the block as *mutable*.
     2. ``FormJac`` short-circuits the mutable-matrix re-evaluation
-       path for ``LoopEqnDiff`` instances (``isinstance`` check) —
-       it uses the already-computed ``fy[3]`` from the custom
-       ``NUM_EQN`` directly instead of re-lambdifying the marker.
+       path for ``LoopEqnDiff`` instances (``isinstance`` check). It
+       builds ``Value0`` from ``_sparsity_row`` / ``_sparsity_col``
+       with placeholder data instead of re-lambdifying the marker,
+       and it does not run the kernel (issue #180).
 
     Phase J3 deliberately keeps the block *dense*. Sparsity
     pruning (only the non-zero positions across all classified
@@ -363,7 +364,7 @@ class LoopEqnDiff(EqnDiff):
         raw_kernel_func._kernel_source = self.kernel_source  # debug
 
         # Wrap the kernel to inject the sparsity arrays automatically
-        # so ``eval_diffs(*args)`` at FormJac / Newton time doesn't
+        # so ``eval_diffs(*args)`` called from ``gy`` doesn't
         # have to thread the extra ``row_arr`` / ``col_arr`` params
         # through ``obtain_eqn_args``. Inline path: closure. JIT
         # module path: the module printer re-generates the wrapper
