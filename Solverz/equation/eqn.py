@@ -17,6 +17,27 @@ from Solverz.num_api.module_parser import modules
 from Solverz.variable.ssymbol import sSym2Sym
 from Solverz.utilities.type_checker import is_zero
 
+# Numba compiles a global NumPy array into a function as a constant only when
+# the array is C or F contiguous and holds at most this many bytes; see
+# ``BaseContext.make_constant_array`` in ``numba/core/base.py``. Any other
+# global array is embedded by its address, which marks the function as using
+# dynamic globals, and Numba then refuses to cache the function. The limit is
+# a local variable of that method, so it cannot be imported and is repeated
+# here. ``test_numba_freeze_limit_matches_numba`` fails if Numba changes it.
+_NUMBA_FREEZE_LIMIT = 10 ** 6
+
+
+def numba_freezes(arr: np.ndarray) -> bool:
+    """Whether Numba compiles a global reference to ``arr`` as a constant.
+
+    The generated LoopEqn functions read an array that Numba freezes as a
+    module-level global, which keeps them cacheable and lets LLVM treat the
+    data as known. Any other array must reach them as an argument, because a
+    global reference to it disables Numba's cache (issues #162 and #170).
+    """
+    return (arr.nbytes <= _NUMBA_FREEZE_LIMIT
+            and (arr.flags.c_contiguous or arr.flags.f_contiguous))
+
 
 class Eqn:
     """
@@ -215,14 +236,15 @@ class LoopEqnDiff(EqnDiff):
         # nodes instead to reach them.
         #
         # Sparse 2-D Params are excluded from the kernel signature:
-        # their contents flow in through module-level CSR arrays
-        # (``_sz_csr_<name>_{data,indices,indptr}``) that the
-        # generated kernel references directly, and numba cannot
-        # type ``csc_array`` as a function argument. Walker Sums
-        # and point-lookup helpers both pull from the CSR arrays,
-        # so no kernel arg is needed for the sparse Param itself.
+        # numba cannot type ``csc_array`` as a function argument, so
+        # their contents flow in through the CSR arrays
+        # ``_sz_csr_<name>_{data,indices,indptr}``, each either read
+        # as a module-level global or passed as a trailing argument,
+        # see ``walker_arg_names`` below. Walker Sums and point-lookup
+        # helpers both pull from the CSR arrays, so no kernel arg is
+        # needed for the sparse Param itself.
         sym_names: set = set()
-        sparse_names: set = set()   # sparse 2-D Params: CSR arrays enter as trailing args
+        sparse_names: set = set()   # sparse 2-D Params, read through their CSR arrays
         for idx_node in canonical.atoms(sp.Indexed):
             base_name = idx_node.base.name
             if base_name not in var_map:
@@ -265,10 +287,36 @@ class LoopEqnDiff(EqnDiff):
         self._nnz = int(sparsity_row.size)
 
         kernel_name = f'_sz_loop_jac_kernel_{sanitized}'
-        # The CSR arrays of the sparse Params the kernel reads follow the
-        # row and column arrays in its signature (issue #162).
-        self.walker_arg_names = [f'_sz_csr_{nm}_{part}' for nm in sorted(sparse_names)
-                                 for part in ('data', 'indices', 'indptr')]
+        # CSR views of every sparse 2-D Param in ``var_map``, converted as
+        # ``LoopEqn._collect_sparse_walkers`` converts them, so they equal
+        # the arrays behind the module-level ``_sz_csr_<M>_<part>`` globals.
+        csr_arrays: Dict[str, np.ndarray] = {}
+        for nm, sol_obj in var_map.items():
+            if not (isinstance(sol_obj, ParamBase)
+                    and getattr(sol_obj, 'sparse', False)
+                    and sol_obj.dim == 2):
+                continue
+            csc_val = sol_obj.v
+            if not hasattr(csc_val, 'tocsr'):
+                continue
+            csr = csc_val.tocsr()
+            csr_arrays[f'_sz_csr_{nm}_data'] = np.ascontiguousarray(
+                csr.data, dtype=float)
+            csr_arrays[f'_sz_csr_{nm}_indices'] = np.ascontiguousarray(
+                csr.indices, dtype=np.int64)
+            csr_arrays[f'_sz_csr_{nm}_indptr'] = np.ascontiguousarray(
+                csr.indptr, dtype=np.int64)
+        walker_names = [f'_sz_csr_{nm}_{part}' for nm in sorted(sparse_names)
+                        for part in ('data', 'indices', 'indptr')]
+        missing = [w for w in walker_names if w not in csr_arrays]
+        if missing:
+            raise ValueError(f"LoopEqnDiff {name!r}: the sparse Param behind {missing} has no value")
+        # A CSR array that Numba would not freeze follows the row and column
+        # arrays in the kernel's signature, since a global reference to it
+        # disables Numba's cache (issue #162). The kernel reads every other
+        # one as a module-level global, which Numba compiles to a constant
+        # and still caches (issue #170).
+        self.walker_arg_names = [w for w in walker_names if not numba_freezes(csr_arrays[w])]
         self.kernel_source, self.helper_sources = build_loop_jac_kernel_source(
             kernel_name, canonical, outer_idx, diff_idx,
             self._nnz, sorted_symbols, var_map,
@@ -303,22 +351,7 @@ class LoopEqnDiff(EqnDiff):
                     pass
         except Exception:
             pass
-        for nm, sol_obj in var_map.items():
-            if not isinstance(sol_obj, ParamBase):
-                continue
-            if not (getattr(sol_obj, 'sparse', False)
-                    and sol_obj.dim == 2):
-                continue
-            csc_val = sol_obj.v
-            if not hasattr(csc_val, 'tocsr'):
-                continue
-            csr = csc_val.tocsr()
-            ns[f'_sz_csr_{nm}_data'] = np.ascontiguousarray(
-                csr.data, dtype=float)
-            ns[f'_sz_csr_{nm}_indices'] = np.ascontiguousarray(
-                csr.indices, dtype=np.int64)
-            ns[f'_sz_csr_{nm}_indptr'] = np.ascontiguousarray(
-                csr.indptr, dtype=np.int64)
+        ns.update(csr_arrays)
         for helper_src in self.helper_sources:
             exec(helper_src, ns)
         exec(self.kernel_source, ns)
@@ -335,10 +368,7 @@ class LoopEqnDiff(EqnDiff):
         _row_arr = self._sparsity_row
         _col_arr = self._sparsity_col
 
-        missing = [nm for nm in self.walker_arg_names if nm not in ns]
-        if missing:
-            raise ValueError(f"LoopEqnDiff {name!r}: the sparse Param behind {missing} has no value")
-        _walker_arrays = tuple(ns[nm] for nm in self.walker_arg_names)
+        _walker_arrays = tuple(csr_arrays[nm] for nm in self.walker_arg_names)
 
         def _kernel_wrapper(*args, _raw=raw_kernel_func,
                              _r=_row_arr, _c=_col_arr, _w=_walker_arrays):
@@ -1489,9 +1519,9 @@ class LoopEqn(Eqn):
 
         Sparse 2-D ``Param``s used as CSR walkers are EXCLUDED — their
         CSR arrays (``_sz_csr_<M>_data`` / ``_sz_csr_<M>_indices`` /
-        ``_sz_csr_<M>_indptr``) follow these names in the signature, see
-        :meth:`walker_arg_names`; they are loaded once at module import
-        and handed down by the ``F_`` wrapper.
+        ``_sz_csr_<M>_indptr``) are loaded once at module import, and
+        the ones Numba would not freeze follow these names in the
+        signature, see :meth:`walker_arg_names`.
 
         This matters because scipy ``csc_array`` objects are not
         understood by Numba — the wrapper ``F_`` would have to
@@ -1503,16 +1533,20 @@ class LoopEqn(Eqn):
                 if nm not in self._sparse_csr]
 
     def walker_arg_names(self) -> List[str]:
-        """The CSR arrays of this LoopEqn's sparse walkers, in the order the
-        generated ``inner_F<N>`` receives them after :meth:`njit_arg_names`:
+        """The CSR arrays of this LoopEqn's sparse walkers that the generated
+        ``inner_F<N>`` receives as arguments, after :meth:`njit_arg_names`:
         ``_sz_csr_<M>_data``, ``_indices`` and ``_indptr`` for each walker
-        ``M`` in sorted order. They are passed as arguments from the
-        Python-level ``F_`` wrapper rather than read as module-level
-        globals, because Numba treats a global array above 1 MB as a
-        dynamic global and then refuses to cache the kernel (issue #162).
+        ``M`` in sorted order, keeping only the arrays Numba would not
+        freeze. The Python-level ``F_`` wrapper passes those down, because
+        a global reference to such an array disables Numba's cache (issue
+        #162). The body reads every other CSR array as a module-level
+        global, which Numba compiles to a constant and still caches, so a
+        model whose arrays are all small pays nothing for the calling
+        convention (issue #170).
         """
         return [f'_sz_csr_{nm}_{part}' for nm in sorted(self._sparse_csr)
-                for part in ('data', 'indices', 'indptr')]
+                for part in ('data', 'indices', 'indptr')
+                if not numba_freezes(self._sparse_csr[nm][part])]
 
     def print_njit_source(self, func_name: str) -> str:
         """Return Numba-compatible Python source for an ``inner_F<N>``
@@ -1537,7 +1571,10 @@ class LoopEqn(Eqn):
         the module printer must make available at module level (via
         ``mut_mat_mappings`` in :mod:`module_generator`). Those
         references resolve to pre-computed CSR arrays of the
-        ``Param``'s CSC value, loaded once at module import time.
+        ``Param``'s CSC value, loaded once at module import time: to
+        the function's own parameter for the arrays in
+        :meth:`walker_arg_names`, and to the module-level global for
+        the rest.
 
         Raises ``NotImplementedError`` for nested ``Sum``s — the inner
         Sum's accumulator would need to reset on each iteration of the
@@ -1546,7 +1583,8 @@ class LoopEqn(Eqn):
         nested Sums; if a real use case appears, the right answer is
         to emit explicit nested ``for`` loops.
         """
-        arg_names = self.njit_arg_names() + self.walker_arg_names()
+        walker_args = self.walker_arg_names()
+        arg_names = self.njit_arg_names() + walker_args
         outer_name = self.outer_index.name
         n_outer = self.n_outer
 
@@ -1556,6 +1594,7 @@ class LoopEqn(Eqn):
             'var_map': self.var_map,
             'outer_name': outer_name,
             'sparse_walker_ctx': None,
+            'walker_args': frozenset(walker_args),
         }
         body_expr = _translate_loop_body_njit(self.body, state)
 
@@ -1955,6 +1994,19 @@ def _find_sum_sparse_walker(sum_node, var_map, outer_name):
     return found
 
 
+def _csr_point_args(base_name: str, walker_args) -> List[str]:
+    """The CSR arrays of the sparse Param ``base_name`` that its point-lookup
+    helper ``_sz_csr_<base_name>_point`` takes after ``row`` and ``col``.
+
+    These are the arrays among ``walker_args`` that its caller receives as
+    arguments because Numba would not freeze them; the helper reads the
+    other ones as module-level globals. The helper's signature and every
+    call to it are built from this one list (issues #162 and #170).
+    """
+    return [f'_sz_csr_{base_name}_{part}' for part in ('data', 'indices', 'indptr')
+            if f'_sz_csr_{base_name}_{part}' in walker_args]
+
+
 def _translate_loop_body_njit(expr, state) -> str:
     """Numba-compatible body translator shared by the inline
     ``_build_num_eqn`` path and the JIT ``print_njit_source`` path.
@@ -2174,11 +2226,10 @@ def _translate_loop_body_njit(expr, state) -> str:
                     expr.indices[1], state)
                 state.setdefault('sparse_point_helpers', set()).add(
                     base_name)
+                call_args = [row_code, col_code] + _csr_point_args(
+                    base_name, state.get('walker_args', ()))
                 return (f"_sz_csr_{base_name}_point("
-                        f"{row_code}, {col_code}, "
-                        f"_sz_csr_{base_name}_data, "
-                        f"_sz_csr_{base_name}_indices, "
-                        f"_sz_csr_{base_name}_indptr)")
+                        f"{', '.join(call_args)})")
         index_strs = [_translate_loop_body_njit(idx, state)
                       for idx in expr.indices]
         return f"{base_name}[{', '.join(index_strs)}]"
