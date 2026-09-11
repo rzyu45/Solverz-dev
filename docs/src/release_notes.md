@@ -4,6 +4,42 @@
 
 ## 0.11.0
 
+### Measured against 0.10.2
+
+Upgrading moves the wall-clock time of a model in two directions. The KLU row matching removes most of the factorization time of a large power-flow Jacobian, while the calling convention of issue 162 makes the residual evaluation of a `LoopEqn` walker slightly slower, and which of the two dominates depends on the model. Both releases were installed side by side and measured back to back on one machine, an Apple M4 with Python 3.11.13, NumPy 2.3.5, SciPy 1.16.3 and Numba 0.65.0, so that Solverz was the only difference. The comparison therefore covers every change listed below, not only the row matching that the first bullet measures on its own.
+
+The power flow is the SolUtil `LoopEqn` formulation of 21 MATPOWER cases, solved by `nr_method` with KLU from the voltages stored in the case file. Each time is the median of five solves.
+
+| case | buses | 0.10.2 | 0.11.0 | gain |
+| --- | ---: | ---: | ---: | ---: |
+| case_SyntheticUSA | 82 000 | 11.5 s | 826 ms | 13.9 |
+| case_ACTIVSg70k | 70 000 | 10.8 s | 723 ms | 15.0 |
+| case_ACTIVSg25k | 25 000 | 535 ms | 158 ms | 3.39 |
+| case13659pegase | 13 659 | 141 ms | 123 ms | 1.14 |
+| case_ACTIVSg10k | 10 000 | 95.0 ms | 57.8 ms | 1.64 |
+| case9241pegase | 9 241 | 117 ms | 111 ms | 1.05 |
+| case6515rte | 6 515 | 36.0 ms | 31.4 ms | 1.15 |
+| case3375wp | 3 374 | 14.0 ms | 11.3 ms | 1.25 |
+| case2869pegase | 2 869 | 26.5 ms | 28.9 ms | 0.92 |
+| case_ACTIVSg2000 | 2 000 | 16.3 ms | 11.3 ms | 1.45 |
+| case1888rte | 1 888 | 6.31 ms | 6.73 ms | 0.94 |
+| case1354pegase | 1 354 | 7.58 ms | 8.85 ms | 0.86 |
+| case_ACTIVSg500 | 500 | 2.12 ms | 2.01 ms | 1.05 |
+| case300 | 300 | 2.14 ms | 2.03 ms | 1.06 |
+| case_ACTIVSg200 | 200 | 0.837 ms | 0.832 ms | 1.01 |
+| case118 | 118 | 0.640 ms | 0.614 ms | 1.04 |
+| case57 | 57 | 0.495 ms | 0.400 ms | 1.24 |
+| case39 | 39 | does not build | 0.218 ms | |
+| case30 | 30 | 0.422 ms | 0.330 ms | 1.28 |
+| case14 | 14 | 0.259 ms | 0.201 ms | 1.29 |
+| case9 | 9 | 0.378 ms | 0.297 ms | 1.27 |
+
+The gain is largest where the factorization dominates. On case_SyntheticUSA one Newton iteration factorizes the Jacobian in 63.6 ms against 1.87 s, a factor of 29, while the residual evaluation takes 5.13 ms against 5.51 ms and the Jacobian evaluation 53.7 ms against 59.0 ms. Three cases between 1 000 and 3 000 buses solve more slowly on 0.11.0; their gains are 0.86 for case1354pegase, 0.92 for case2869pegase and 0.94 for case1888rte. case39 does not build on 0.10.2 because of [#151](https://github.com/smallbunnies/Solverz/issues/151). For each of the twenty cases that both releases build, the Jacobian carries the same number of nonzeros on both, so the sparsity analyzer still reserves the same pattern after the `Set` and `LoopEqn` fixes below.
+
+These gains are specific to power flow. The row matching pays off in proportion to how empty the structural diagonal of the Jacobian is, and a `LoopEqn` power-flow Jacobian, whose rows follow the PV and PQ sets while its columns follow the buses, is the extreme case.
+
+The Cookbook IES, a differential-algebraic model of coupled electricity, heat and gas networks integrated by `Rodas`, is the one other model measured on both releases. With the scalar `Eqn` formulation, `loopeqn=False`, the Jacobian evaluation takes 2969 µs on 0.11.0 against 3569 µs on 0.10.2, 17 percent less, which is the gather of [#160](https://github.com/smallbunnies/Solverz/issues/160), while the residual evaluation is unchanged at 813 µs against 808 µs. Both figures come from the two generated modules loaded in one process and timed in ten alternating rounds, and each module timed alone in its own environment gives the same residual, 806 µs against 805 µs. The first Numba compilation of the module took 329 s twice on 0.11.0 and 342.5 s on 0.10.2, and two runs of one build differed by as much as 50 s. On this model the release is therefore neutral in the residual and faster in the Jacobian. Figures posted earlier to [#134](https://github.com/smallbunnies/Solverz/issues/134) and [#170](https://github.com/smallbunnies/Solverz/issues/170) showed the residual 18 percent slower on 0.11.0; they came from one process per environment and do not reproduce.
+
 ### New
 
 - **KLU factorizes with a maximum-product row matching in front of its ordering, and its block triangular form is off.** KLU keeps the structural diagonal as its pivot sequence and used to obtain that diagonal from the maximum transversal of the block triangular form, which is blind to the magnitudes. For a Jacobian whose structural diagonal is empty, as every `LoopEqn` model produces because rows follow the equation blocks and columns follow the variables, the AMD ordering of that arbitrary matching carried up to several times the fill of a magnitude-aware one. On the SolUtil power flow of MATPOWER case_ACTIVSg70k the factorization took 1.3 s against 0.19 s for SuperLU; with the rows permuted so that every column has its largest entry, or one close to it, on the diagonal, it takes 52 ms, and every other matrix tried (transient-stability and gas-network iteration matrices, power-flow Jacobians from 9 to 82 000 buses) factorizes as fast or faster than before. The permutation is the maximum-product matching of the MC64 criterion, computed by the new `Solverz.solvers.matching` module with successive shortest augmenting paths in Numba under a work budget, stored with the cached `KLUSymbolic`, and applied to the right-hand side inside `klu_decomposition.solve`, so `nr_method`, `Rodas` and every other caller keep their interface. SciPy's `min_weight_full_bipartite_matching` was not used because its Hopcroft-Karp feasibility pass does not terminate in reasonable time on some chain-like patterns such as the cookbook IES iteration matrix. Systems below 1 000 unknowns keep the previous path unchanged, because the fixed cost of the matching call exceeds their whole factorization; `set_klu_matching(True, min_n=...)` or `SOLVERZ_KLU_MATCHING_MIN_N` moves that threshold, and `set_klu_matching(False)` or `SOLVERZ_KLU_MATCHING=0` restores the previous behaviour everywhere. Measured with the SolUtil LoopEqn power flow on one machine, a Newton solve from the case-file start with KLU takes 8.5 s before and 1.1 s after the change on case_ACTIVSg70k, 9.9 s and 1.2 s on case_SyntheticUSA (82 000 buses), and 476 ms and 241 ms on case_ACTIVSg25k, twice as fast as SuperLU in the same run, while cases between 2 000 and 14 000 buses are within run-to-run noise of the previous times.
