@@ -168,3 +168,41 @@ def test_matching_reaches_klu_and_removes_off_diagonal_pivots():
     d_off = klu_decomposition(A, matching=False)
     assert d_off.symbolic.perm is None
     assert d_off._common.btf == 1
+
+
+def test_symbolic_not_reused_for_other_row_indices():
+    """A matrix with the shape, nnz and indptr of the cached pattern but other
+    row indices gets a symbolic analysis of its own. Above ``MATCHING_MIN_N``
+    the matching arrays of the cached pattern would gather its values into
+    that pattern, and KLU would solve another matrix without an error
+    (issue #184)."""
+    from Solverz.solvers import klu_backend as kb
+    n = 1200
+    assert n >= kb.MATCHING_MIN_N
+    A1 = sp.csc_array(sp.random(n, n, density=4 / n, random_state=0, format="csc") + 5 * sp.eye(n, format="csc"))
+    A1.sum_duplicates()
+    A1.sort_indices()
+    # A2: one off-diagonal entry of one column moved to a row the column lacks
+    A2 = A1.copy()
+    col = next(c for c in range(n) if (A2.indices[A2.indptr[c]:A2.indptr[c + 1]] != c).any())
+    s, e = A2.indptr[col], A2.indptr[col + 1]
+    p = s + int(np.flatnonzero(A2.indices[s:e] != col)[0])
+    A2.indices[p] = next(r for r in range(n) if r not in set(A2.indices[s:e].tolist()))
+    A2.has_sorted_indices = False
+    A2.sort_indices()
+    assert np.array_equal(A1.indptr, A2.indptr) and not np.array_equal(A1.indices, A2.indices)
+
+    b = np.random.default_rng(1).standard_normal(n)
+    d1 = klu_decomposition(A1)
+    assert d1.symbolic.perm is not None
+    d2 = klu_decomposition(A2, symbolic=d1.symbolic)
+    assert d2.symbolic is not d1.symbolic
+    assert np.allclose(d2.solve(b), splu(sp.csc_matrix(A2)).solve(b), atol=1e-10)
+    # the same pattern with new values still reuses the analysis
+    A3 = A2.copy()
+    A3.data *= 1.1
+    assert klu_decomposition(A3, symbolic=d2.symbolic).symbolic is d2.symbolic
+    cache = KLUCache()
+    lu_decomposition(A1, backend="klu", cache=cache)
+    x = lu_decomposition(A2, backend="klu", cache=cache).solve(b)
+    assert np.allclose(A2 @ x, b, atol=1e-10)
