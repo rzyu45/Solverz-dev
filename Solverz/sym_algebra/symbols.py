@@ -1,7 +1,8 @@
 from typing import Dict
 
 import numpy as np
-from sympy import Symbol, Expr
+from sympy import Basic, Expr, Integer, Symbol, Tuple
+from sympy.core.symbol import Str
 
 from Solverz.num_api.Array import Array
 
@@ -80,6 +81,26 @@ def SymbolExtractor(index) -> Dict:
             temp.update(SymbolExtractor(index[1]))
 
     return temp
+
+
+def IndexKey(index) -> Basic:
+    """A SymPy object that compares equal exactly when two indices do.
+
+    The printed form of an index is not enough, because it drops what an
+    index does not print: the token of a ``Set`` index and the bounds of an
+    ``Idx`` (issue #168). Lists and slices are not hashable, so they are
+    converted, each tagged with its kind.
+    """
+    if isinstance(index, Basic):
+        return index
+    if isinstance(index, (int, np.integer)):
+        return Integer(int(index))
+    if isinstance(index, (list, tuple)):
+        return Tuple(Str(type(index).__name__), *(IndexKey(i) for i in index))
+    if isinstance(index, slice):
+        return Tuple(Str('slice'), *(Str('None') if v is None else IndexKey(v)
+                                     for v in (index.start, index.stop, index.step)))
+    raise TypeError(f"Unsupported idx type {type(index)}")
 
 
 Solverz_internal_name = ['y_', 'F_', 'F__' 'p_', 'J_', 'p__'
@@ -174,15 +195,28 @@ class IdxSymBasic(Symbol):
             raise TypeError(f"Unsupported idx type {type(index)}")
         if not isinstance(symbol, Symbol):
             raise TypeError(f"Invalid symbol type {type(symbol)}")
-        obj = Symbol.__new__(cls, f'{symbol.name}[{index}]')
+        # Not through Symbol.__new__, whose cache is keyed on the name alone:
+        # every construction of one printed name would get the same instance
+        # back, and the assignments below would rewrite the index of an
+        # object that earlier expressions already hold (issue #168).
+        obj = Symbol.__xnew__(cls, f'{symbol.name}[{index}]')
         obj.symbol0 = symbol
         obj.index = index
         obj.name0 = symbol.name
         obj.name = obj.name0 + '[' + IndexPrinter(index) + ']'
         obj.SymInIndex = SymbolExtractor(index)
         obj.dim = dim
+        obj.index_key = IndexKey(index)
 
         return obj
+
+    def _hashable_content(self):
+        # The name prints a Set index or an Idx by its label alone, and the
+        # base symbol without its dim or value. Compare the index itself
+        # (issue #168) and the base symbol and dim (issue #175), or SymPy's
+        # caches, which are keyed on this equality, hand one model an
+        # expression that holds another model's index or symbol.
+        return super()._hashable_content() + (self.index_key, self.symbol0, self.dim)
 
     def _numpycode(self, printer, **kwargs):
 
