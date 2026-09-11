@@ -262,7 +262,8 @@ def print_eqn_assignment(EQNs: Dict[str, Eqn],
             _F_ = iVar('_F_', internal_use=True)
             # ``LoopEqn`` with sparse walkers prints its ``inner_F<N>``
             # with the sparse Params EXCLUDED from the signature (their
-            # CSR arrays ride in as module-level constants). The call
+            # CSR arrays ride in as module-level constants, and the ones
+            # Numba would not freeze also as trailing arguments). The call
             # site must match the pruned signature exactly — otherwise
             # the inner function receives a positional csc_array that
             # numba cannot handle. For non-LoopEqn equations and dense

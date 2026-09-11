@@ -83,9 +83,11 @@ def render_modules(eqs: SymEquations,
     # Precompute architecture: sub_inner_F no longer receives sparse matrices,
     # so all sub-functions can now be @njit (empty no_njit set).
     code_dict["no_njit_sub_inner_F"] = set()
-    # CSR arrays of every LoopEqn walker: F_ hands them to inner_F and
-    # inner_F to the inner_F<N> that walks them, so no compiled function
-    # reads a module-level array and Numba can cache all of them (#162).
+    # CSR arrays of the LoopEqn walkers that Numba would not freeze: F_
+    # hands them to inner_F and inner_F to the inner_F<N> that walks them,
+    # because a compiled function that reads such an array as a global
+    # cannot be cached (#162). The rest stay module-level globals, which
+    # Numba compiles to constants and still caches (#170).
     from Solverz.equation.eqn import LoopEqn as _LoopEqnCls
     walker_args = sorted({w for _eqn in eqs.EQNs.values() if isinstance(_eqn, _LoopEqnCls)
                           for w in _eqn.walker_arg_names()})
@@ -164,9 +166,10 @@ def render_modules(eqs: SymEquations,
     # ``Sum`` body. They ride to the module through the same
     # ``mut_mat_mappings`` → ``eqn_parameter`` → pickle →
     # ``setting["<key>"] = ...`` pipeline used by mutable matrix
-    # Jacobian blocks, and the Python-level ``F_`` / ``J_`` wrappers pass
-    # them down as arguments so that no @njit function reads a global
-    # array, which would disable Numba's cache above 1 MB (issue #162).
+    # Jacobian blocks. The @njit functions read the arrays Numba freezes
+    # as these globals; the Python-level ``F_`` / ``J_`` wrappers pass
+    # every other one down as an argument, since a global reference to
+    # it would disable Numba's cache (issues #162 and #170).
     from Solverz.equation.eqn import LoopEqn as _LoopEqnCls
     for _eqn in eqs.EQNs.values():
         if not isinstance(_eqn, _LoopEqnCls):

@@ -3232,45 +3232,29 @@ def test_check_canonical_invariants_reports_a_lifted_delta():
     assert any(x.startswith("index label 'f[j]'") for x in problems)
 
 
-def test_loop_eqn_walker_above_one_megabyte_is_cached_by_numba(tmp_path):
-    """The CSR arrays of a sparse walker and the row / column arrays of a
-    loop Jacobian kernel reach the compiled functions as arguments, so
-    Numba caches them even when they exceed its 1 MB limit for frozen
-    global arrays (issue #162)."""
-    import importlib
-    import os
-    import re
-    import sys
-    import warnings
-
-    from scipy.sparse import random as sp_random, eye as sp_eye
-    from Solverz import LoopEqn, module_printer
-
-    n = 20000
-    rng = np.random.default_rng(0)
-    G = csc_array(sp_random(n, n, density=150000 / n ** 2, format='csc', random_state=rng) + sp_eye(n) * 0.5)
-    assert G.data.nbytes > 10 ** 6
-
+def _sin_walker_module(tmp_path, name, G):
+    """Render ``b[i] - sum_j sin(G[i, j] x[j])`` with ``jit=True`` and return
+    the generated ``num_func.py`` source. ``sin`` keeps the Jacobian a loop
+    kernel that reads ``G`` by point lookup."""
+    n = G.shape[0]
     m = Model()
     m.x = Var('x', np.ones(n))
     m.G = Param('G', G, dim=2, sparse=True)
     m.b = Param('b', np.ones(n))
     i, j = sp.Idx('i'), sp.Idx('j')
     xs, Gs, bs = sp.IndexedBase('x'), sp.IndexedBase('G'), sp.IndexedBase('b')
-    # sin(G x) keeps the Jacobian a loop kernel that reads G by point lookup
     m.eqn = LoopEqn('eqn', outer_index=i, n_outer=n,
                     body=bs[i] - sp.Sum(sp.sin(Gs[i, j] * xs[j]), (j, 0, n - 1)),
                     var_map={'x': m.x, 'G': m.G, 'b': m.b})
     spf, y0 = m.create_instance()
-    name = 'sz_test_big_walker'
     module_printer(spf, y0, name, directory=str(tmp_path), jit=True).render()
-    src = (tmp_path / name / 'num_func.py').read_text()
-    walkers = '_sz_csr_G_data, _sz_csr_G_indices, _sz_csr_G_indptr'
-    assert re.search(rf'def inner_F0\(.*{walkers}\):', src)
-    assert re.search(rf'return inner_F\(_F_, .*{walkers}\)', src)
-    assert re.search(rf'def inner_J\(_data_, .*_sz_loop_jac_row_0, _sz_loop_jac_col_0, {walkers}\):', src)
-    assert re.search(rf'def _sz_csr_G_point\(row, col, {walkers}\):', src)
-    assert re.search(rf'_sz_loop_jac_kernel_0\(.*_sz_loop_jac_row_0, _sz_loop_jac_col_0, {walkers}\)', src)
+    return (tmp_path / name / 'num_func.py').read_text()
+
+
+def _import_and_check_sin_walker(tmp_path, name, G, cached):
+    """Import the module of :func:`_sin_walker_module`, check F and J against
+    their closed forms at ``x = 1``, and assert that Numba refused to cache
+    nothing and wrote an index file for every function named in ``cached``."""
     sys.path.insert(0, str(tmp_path))
     try:
         with warnings.catch_warnings(record=True) as caught:
@@ -3286,10 +3270,117 @@ def test_loop_eqn_walker_above_one_megabyte_is_cached_by_numba(tmp_path):
         assert abs(J - ref).max() < 1e-12
         # every compiled function left an index file in its own cache directory
         num_func = sys.modules[f'{name}.num_func']
-        for fn in ('inner_F0', 'inner_F', 'inner_J', '_sz_loop_jac_kernel_0'):
+        for fn in cached:
             cache_dir = getattr(num_func, fn)._cache._cache_path
             assert any(f.startswith(f'num_func.{fn}-') and f.endswith('.nbi') for f in os.listdir(cache_dir)), fn
     finally:
         sys.path.remove(str(tmp_path))
         for k in [k for k in sys.modules if k.startswith(name)]:
             del sys.modules[k]
+
+
+def test_loop_eqn_walker_above_one_megabyte_is_cached_by_numba(tmp_path):
+    """A CSR array of a sparse walker, or a row / column array of a loop
+    Jacobian kernel, that exceeds Numba's limit for frozen global arrays
+    reaches the compiled functions as an argument, so Numba caches them
+    (issue #162). An array under the limit stays a module-level global even
+    when its walker's other arrays are over it (issue #170): here ``indptr``
+    holds 20 001 entries, 160 kB, while ``data``, ``indices`` and the
+    kernel's row and column arrays hold 170 000 entries, 1.36 MB each."""
+    import re
+
+    from scipy.sparse import random as sp_random, eye as sp_eye
+
+    from Solverz.equation.eqn import numba_freezes
+
+    n = 20000
+    rng = np.random.default_rng(0)
+    G = csc_array(sp_random(n, n, density=150000 / n ** 2, format='csc', random_state=rng) + sp_eye(n) * 0.5)
+    csr = G.tocsr()
+    assert not numba_freezes(csr.data.astype(float))
+    assert not numba_freezes(csr.indices.astype(np.int64))
+    assert numba_freezes(csr.indptr.astype(np.int64))
+
+    name = 'sz_test_big_walker'
+    src = _sin_walker_module(tmp_path, name, G)
+    walkers = '_sz_csr_G_data, _sz_csr_G_indices'
+    assert re.search(rf'def inner_F0\(.*{walkers}\):', src)
+    assert re.search(rf'return inner_F\(_F_, .*{walkers}\)', src)
+    assert re.search(rf'def inner_J\(_data_, .*_sz_loop_jac_row_0, _sz_loop_jac_col_0, {walkers}\):', src)
+    assert re.search(rf'def _sz_csr_G_point\(row, col, {walkers}\):', src)
+    assert re.search(rf'_sz_loop_jac_kernel_0\(.*_sz_loop_jac_row_0, _sz_loop_jac_col_0, {walkers}\)', src)
+    # indptr is read as the module-level global, and no function receives it
+    assert '_sz_csr_G_indptr = setting["_sz_csr_G_indptr"]' in src
+    assert not [p for _, p in re.findall(r'^def (\w+)\((.*)\):', src, re.M) if '_sz_csr_G_indptr' in p]
+    _import_and_check_sin_walker(tmp_path, name, G,
+                                 ('inner_F0', 'inner_F', 'inner_J', '_sz_loop_jac_kernel_0', '_sz_csr_G_point'))
+
+
+def test_loop_eqn_walker_under_the_freeze_limit_stays_a_global(tmp_path):
+    """When every array is under Numba's limit, no compiled function receives
+    a CSR or a row / column array, as before issue #162. Numba freezes each
+    of them into a constant and still caches the function, so passing them
+    as arguments bought nothing and slowed F by up to a factor of 1.7 on the
+    small power-flow cases (issue #170)."""
+    import re
+
+    n = 200
+    rng = np.random.default_rng(1)
+    dense = np.where(rng.random((n, n)) < 0.05, rng.standard_normal((n, n)), 0.0) + 0.5 * np.eye(n)
+    G = csc_array(dense)
+
+    name = 'sz_test_small_walker'
+    src = _sin_walker_module(tmp_path, name, G)
+    signatures = dict(re.findall(r'^def (\w+)\((.*)\):', src, re.M))
+    received = {fn: p for fn, p in signatures.items() if '_sz_csr_' in p or '_sz_loop_jac_' in p}
+    assert received == {}
+    assert signatures['_sz_csr_G_point'] == 'row, col'
+    assert re.search(r'_sz_loop_jac_kernel_0\(.*_sz_loop_jac_row_0, _sz_loop_jac_col_0\)', src)
+    for part in ('data', 'indices', 'indptr'):
+        assert f'_sz_csr_G_{part} = setting["_sz_csr_G_{part}"]' in src
+    _import_and_check_sin_walker(tmp_path, name, G,
+                                 ('inner_F0', 'inner_F', 'inner_J', '_sz_loop_jac_kernel_0', '_sz_csr_G_point'))
+
+
+def test_numba_freeze_limit_matches_numba(tmp_path):
+    """``numba_freezes`` repeats a limit that Numba keeps in a local variable,
+    so this pins it to the installed Numba. A global array of exactly
+    ``_NUMBA_FREEZE_LIMIT`` bytes compiles into a cacheable function, while
+    one element more, or a non-contiguous view, makes Numba refuse the
+    cache. A Numba release that moves the limit fails here instead of
+    silently disabling the cache or costing throughput."""
+    from Solverz.equation.eqn import _NUMBA_FREEZE_LIMIT, numba_freezes
+
+    n = _NUMBA_FREEZE_LIMIT // 8
+    at, above, strided = np.ones(n), np.ones(n + 1), np.ones(8)[::2]
+    assert (numba_freezes(at), numba_freezes(above), numba_freezes(strided)) == (True, False, False)
+
+    name = f'sz_test_freeze_{uuid.uuid4().hex[:8]}'
+    (tmp_path / f'{name}.py').write_text(
+        'import numpy as np\n'
+        'from numba import njit\n'
+        f'AT = np.ones({n})\n'
+        f'ABOVE = np.ones({n + 1})\n'
+        'STRIDED = np.ones(8)[::2]\n'
+        '@njit(cache=True)\n'
+        'def at():\n'
+        '    return AT[0]\n'
+        '@njit(cache=True)\n'
+        'def above():\n'
+        '    return ABOVE[0]\n'
+        '@njit(cache=True)\n'
+        'def strided():\n'
+        '    return STRIDED[0]\n')
+    sys.path.insert(0, str(tmp_path))
+    try:
+        mod = importlib.import_module(name)
+        refused = {}
+        for fn in ('at', 'above', 'strided'):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                assert getattr(mod, fn)() == 1.0
+            refused[fn] = any('Cannot cache' in str(w.message) for w in caught)
+        assert refused == {'at': False, 'above': True, 'strided': True}
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop(name, None)

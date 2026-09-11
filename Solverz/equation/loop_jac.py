@@ -2196,10 +2196,13 @@ def build_loop_jac_kernel_source(func_name: str,
         generated function. The caller can pick unique names to
         avoid collision in the module-level scope.
     walker_names : sequence of str
-        The ``_sz_csr_<M>_data`` / ``_indices`` / ``_indptr`` names of the
-        sparse Params the body reads, appended to the signature after the
-        row / col arrays and passed to the point-lookup helpers, so that
-        no compiled function reads a module-level array (issue #162).
+        The ``_sz_csr_<M>_data`` / ``_indices`` / ``_indptr`` arrays of the
+        sparse Params the body reads that Numba would not freeze, appended
+        to the signature after the row / col arrays and passed to the
+        point-lookup helpers, since a global reference to such an array
+        disables Numba's cache (issue #162). The kernel and the helpers
+        read every other CSR array as a module-level global, which Numba
+        compiles to a constant (issue #170).
 
     Returns
     -------
@@ -2209,7 +2212,7 @@ def build_loop_jac_kernel_source(func_name: str,
         the inline path) or to ``@njit(cache=True)``-decorate and
         paste into a module file (for the JIT path).
     """
-    from Solverz.equation.eqn import _translate_loop_body_njit
+    from Solverz.equation.eqn import _csr_point_args, _translate_loop_body_njit
 
     outer_name = _name_of(outer_idx)
     diff_name = _name_of(diff_idx)
@@ -2225,6 +2228,7 @@ def build_loop_jac_kernel_source(func_name: str,
             'outer_name': outer_name,
             'sparse_walker_ctx': None,
             'sparse_point_helpers': set(),
+            'walker_args': frozenset(walker_names),
         }
 
     # Try to decompose the canonical Add into per-δ branches so the
@@ -2279,10 +2283,9 @@ def build_loop_jac_kernel_source(func_name: str,
     else:
         all_point_helpers = state.get('sparse_point_helpers', set())
     for walker_name in sorted(all_point_helpers):
+        params = ['row', 'col'] + _csr_point_args(walker_name, walker_names)
         helper_sources.append(
-            f"def _sz_csr_{walker_name}_point(row, col, "
-            f"_sz_csr_{walker_name}_data, _sz_csr_{walker_name}_indices, "
-            f"_sz_csr_{walker_name}_indptr):\n"
+            f"def _sz_csr_{walker_name}_point({', '.join(params)}):\n"
             f"{indent}for _sz_pk in range("
             f"_sz_csr_{walker_name}_indptr[row], "
             f"_sz_csr_{walker_name}_indptr[row + 1]):\n"

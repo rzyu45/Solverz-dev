@@ -13,6 +13,7 @@ from Solverz.code_printer.python.module.mutable_mat_analyzer import (
     generate_block_function_code,
     MutableMatBlockMapping,
 )
+from Solverz.equation.eqn import numba_freezes
 from Solverz.equation.source import format_source
 
 
@@ -367,6 +368,10 @@ def print_inner_J(var_addr: Address,
                         'row_key': row_key,
                         'col_key': col_key,
                         'walker_args': list(ed.walker_arg_names),
+                        # the row / col arrays that inner_J must receive as
+                        # arguments, like the walker arrays above
+                        'row_col_args': [key for key in (row_key, col_key)
+                                         if not numba_freezes(mut_mat_mappings[key])],
                     })
                     addr_by_ele_0 += jb.SpEleSize
                     continue
@@ -471,15 +476,17 @@ def print_inner_J(var_addr: Address,
     # is inlined by numba at JIT time — no Python/numba boundary
     # crossing per kernel call at runtime. The row / col arrays of the
     # kernels (``_sz_loop_jac_row_<N>`` / ``_sz_loop_jac_col_<N>``) and
-    # the CSR arrays of their sparse walkers enter ``inner_J`` as
-    # arguments from the ``J_`` wrapper, not as module-level globals:
-    # Numba treats a global array above 1 MB as a dynamic global and
-    # then refuses to cache the function (issue #162).
+    # the CSR arrays of their sparse walkers are module-level globals.
+    # The ones Numba would not freeze enter ``inner_J`` as arguments from
+    # the ``J_`` wrapper instead, because a global reference to such an
+    # array makes Numba refuse to cache the function (issue #162). Every
+    # other one stays a global, which Numba compiles to a constant and
+    # still caches (issue #170).
     extra_names = []
     for mb in mutable_matrix_blocks:
         if mb.get('mode') != 'loop_eqn':
             continue
-        for nm in [mb['row_key'], mb['col_key']] + list(mb['walker_args']):
+        for nm in list(mb['row_col_args']) + list(mb['walker_args']):
             if nm not in extra_names:
                 extra_names.append(nm)
         kernel_args = [symbols(nm, real=True)
@@ -1224,7 +1231,8 @@ def print_inner_F(EQNs: Dict[str, Eqn],
     for placeholder in fallback_placeholders:
         args.append(symbols(placeholder.name, real=True))
 
-    # CSR arrays of the LoopEqn walkers, handed down from F_ (issue #162)
+    # CSR arrays of the LoopEqn walkers that Numba would not freeze,
+    # handed down from F_ (issues #162 and #170)
     fp = FunctionPrototype(real, 'inner_F', [symbols('_F_', real=True)] + args
                            + [symbols(w, real=True) for w in walker_args])
     body = []
@@ -1284,8 +1292,8 @@ def print_eqn_assignment_with_precompute(EQNs, EqnAddr, precompute_info):
         if eqn.mixed_matrix_vector:
             sub_args = [symbols(a.name, real=True) for a in eqn_info['args']]
         elif isinstance(eqn, LoopEqn):
-            # Exclude sparse walker Params (they're module-level CSR
-            # constants, not call arguments).
+            # Exclude sparse walker Params; their CSR arrays follow, the
+            # ones Numba would not freeze, see ``walker_arg_names``.
             sub_args = ([eqn.SYMBOLS[nm] for nm in eqn.njit_arg_names()]
                         + [symbols(w, real=True) for w in eqn.walker_arg_names()])
         else:
@@ -1336,8 +1344,9 @@ def print_sub_inner_F(EQNs: Dict[str, Eqn]):
         if isinstance(eqn, LoopEqn):
             # Use njit_arg_names so sparse walker Params are excluded
             # from the sub-function's signature. Their CSR arrays are
-            # pulled from module-level constants injected via
-            # ``mut_mat_mappings`` by ``render_modules``.
+            # module-level constants injected via ``mut_mat_mappings`` by
+            # ``render_modules``; the ones Numba would not freeze are
+            # passed in as well, see ``LoopEqn.walker_arg_names``.
             arg_names = eqn.njit_arg_names() + eqn.walker_arg_names()
             args = [symbols(v, real=True) for v in arg_names]
             _doc = f"{eqn_name}{format_source(getattr(eqn, 'source', None))}"
