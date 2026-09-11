@@ -642,7 +642,7 @@ class matvec(MulVarFunc):
 
     def fdiff(self, argindex=1):
         if argindex == 5:
-            return Para(self.args[0].name.removesuffix('_data'))
+            return Para(self.args[0].name.removesuffix('_data'), dim=2)
         else:
             return Integer(0)
 
