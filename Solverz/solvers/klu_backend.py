@@ -208,12 +208,16 @@ class KLUCache:
     Stored on the model (``dae``/``ae``/``fdae``) by the solver and threaded
     into :func:`Solverz.solvers.laesolver.lu_decomposition` so the BTF+AMD
     ordering is computed once and reused for every step of a run.
+    ``superlu`` holds the SuperLU column ordering of the same pattern, a
+    :class:`Solverz.solvers.laesolver.SuperLUOrdering`, which the SuperLU
+    backend reuses in the same way (issue #182).
     """
 
-    __slots__ = ("symbolic",)
+    __slots__ = ("symbolic", "superlu")
 
     def __init__(self):
         self.symbolic = None
+        self.superlu = None
 
 
 def _as_int32_csc(A):

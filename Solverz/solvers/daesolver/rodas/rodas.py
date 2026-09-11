@@ -119,7 +119,9 @@ def Rodas(dae: nDAE,
     M = dae.M
     p = dae.p
     linsolver = resolve_backend(getattr(opt, 'linsolver', None))
-    klu_cache = KLUCache() if linsolver == 'klu' else None
+    # Keeps the KLU symbolic analysis, or the SuperLU column ordering, of the
+    # iteration matrix, whose pattern the steps share.
+    klu_cache = KLUCache()
     done = False
     reject = 0
     # Whether the row-equilibration reduction densifies (sparse iteration
