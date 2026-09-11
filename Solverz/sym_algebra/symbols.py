@@ -98,6 +98,19 @@ Solverz_internal_name = ['y_', 'F_', 'F__' 'p_', 'J_', 'p__'
 Solverz_internal_prefixes = ['_sz_mm_', '_sz_mb_']
 
 
+def ValueKey(value) -> tuple:
+    """A key that compares equal exactly when two symbol values do.
+
+    ``SolSymBasic`` keeps its value as a dense ndarray, and
+    ``Equations.add_eqn`` registers an undeclared parameter from the value of
+    the symbol it finds in an equation, so two symbols that carry different
+    values must not compare equal (issue #175).
+    """
+    if value is None:
+        return ()
+    return value.dtype.str, value.shape, value.tobytes()
+
+
 class SolSymBasic(Symbol):
     """
     Basic class for Solverz Symbols
@@ -119,15 +132,32 @@ class SolSymBasic(Symbol):
                         f"the code generator for Mat_Mul / mutable-matrix "
                         f"Jacobian helper names and cannot be used for user "
                         f"variables or parameters.")
-        obj = Symbol.__new__(cls, f'{name}')
+        # Not through Symbol.__new__, whose cache is keyed on the name alone:
+        # every construction of one name would get the same instance back,
+        # and the assignments below would rewrite the dim and value of an
+        # object that earlier expressions already hold (issue #175).
+        obj = Symbol.__xnew__(cls, f'{name}')
         obj.name = f'{name}'
         obj.dim = dim
         if value is not None:
             obj.value = Array(value, dim)
         else:
             obj.value = None
+        obj.value_key = ValueKey(obj.value)
         obj.initialized = True if value is not None else False
         return obj
+
+    def _hashable_content(self):
+        # The name says neither whether the symbol is a vector or a matrix
+        # nor which value it carries. Compare both, or SymPy's caches, which
+        # are keyed on this equality, hand one model an expression that
+        # holds another model's symbol (issue #175).
+        return super()._hashable_content() + (self.dim, self.value_key)
+
+    def __getnewargs_ex__(self):
+        # Symbol rebuilds a pickled or copied symbol from its name alone,
+        # which now gives a symbol unequal to the original.
+        return (self.name,), {'value': self.value, 'dim': self.dim, 'internal_use': True}
 
     def __getitem__(self, index):
         pass
@@ -224,7 +254,12 @@ class idx(SolSymBasic):
         obj = SolSymBasic.__new__(cls, name, value, dim=1)
         if obj.value is not None:
             obj.value = Array(value, dim=1, dtype=int)
+            obj.value_key = ValueKey(obj.value)
         return obj
+
+    def __getnewargs_ex__(self):
+        # idx is always 1-D, and its constructor takes no internal_use.
+        return (self.name,), {'value': self.value}
 
     def __getitem__(self, index):
         return Idxidx(self, index, dim=1)
