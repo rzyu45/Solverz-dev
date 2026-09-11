@@ -2280,7 +2280,7 @@ def build_loop_jac_kernel_source(func_name: str,
         the inline path) or to ``@njit(cache=True)``-decorate and
         paste into a module file (for the JIT path). Its signature is
         ``(<symbols>, <row_arr_param>, <col_arr_param>, <walker_names>,
-        _sz_pos_0, _sz_pos_1, ...)``.
+        _sz_pos_0, _sz_pos_1, ..., <hoisted>)``.
     helper_sources : list of str
         The sources of the ``_sz_csr_<M>_point`` search helpers that the
         kernel calls.
@@ -2289,8 +2289,14 @@ def build_loop_jac_kernel_source(func_name: str,
         argument: the position of the entry the kernel reads in the CSR
         data of its Param, or -1 where the Param stores no entry, which
         reads as 0.0 as it does through the search helper.
+    hoisted : dict
+        The vectors the kernel reads, name → ``(np_func, var)``, such as
+        ``'_sz_h_cos_Va': ('np.cos', 'Va')``, which close its signature and
+        which the caller computes as ``np_func(var)`` once per call, so a
+        transcendental function of a Var entry is evaluated once per entry
+        and not once per use (issue #183).
     """
-    from Solverz.equation.eqn import _csr_point_args, _translate_loop_body_njit
+    from Solverz.equation.eqn import _csr_point_args, _hoisting, _translate_loop_body_njit
 
     outer_name = _name_of(outer_idx)
     diff_name = _name_of(diff_idx)
@@ -2303,6 +2309,8 @@ def build_loop_jac_kernel_source(func_name: str,
     point_helpers: set = set()
     point_positions: List[np.ndarray] = []
     point_codes: Dict[Tuple[str, str, str], object] = {}
+    hoisted: Dict[str, Tuple[str, str]] = {}
+    hoist = _hoisting(var_map, hoisted)
     index_values = None
     if row_arr is not None and col_arr is not None and csr_arrays is not None:
         # An index expression of the body is evaluated at every position
@@ -2352,6 +2360,7 @@ def build_loop_jac_kernel_source(func_name: str,
             'sparse_walker_ctx': None,
             'sparse_point_helpers': point_helpers,
             'point_position': _point_position if index_values is not None else None,
+            'hoist': hoist,
             'walker_args': frozenset(walker_names),
         }
 
@@ -2413,7 +2422,7 @@ def build_loop_jac_kernel_source(func_name: str,
         )
 
     arg_list = (list(symbols_list) + [row_arr_param, col_arr_param] + list(walker_names)
-                + [f'_sz_pos_{n}' for n in range(len(point_positions))])
+                + [f'_sz_pos_{n}' for n in range(len(point_positions))] + list(hoisted))
     lines = [
         f"def {func_name}({', '.join(arg_list)}):",
         f"{indent}data = np.empty({nnz})",
@@ -2436,7 +2445,7 @@ def build_loop_jac_kernel_source(func_name: str,
     lines.append(f"{indent}return data")
     kernel_source = '\n'.join(lines) + '\n'
 
-    return kernel_source, helper_sources, point_positions
+    return kernel_source, helper_sources, point_positions, hoisted
 
 
 def _eval_index_code(code: str, values, n: int):

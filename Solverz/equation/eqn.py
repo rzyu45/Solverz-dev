@@ -213,7 +213,8 @@ class LoopEqnDiff(EqnDiff):
                  diff_idx,
                  n_outer: int,
                  n_diff: int,
-                 var_map: Dict[str, object]):
+                 var_map: Dict[str, object],
+                 expand_trig: bool = True):
         from Solverz.equation.loop_jac import (
             build_loop_jac_kernel_source,
             compute_loop_jac_sparsity,
@@ -321,8 +322,17 @@ class LoopEqnDiff(EqnDiff):
         # ``point_pos_arrays`` hold, for each nonzero, the position in the CSR
         # data of a sparse Param of the entry the kernel reads there. They
         # follow the walker arrays in the kernel's signature (issue #179).
-        self.kernel_source, self.helper_sources, self.point_pos_arrays = build_loop_jac_kernel_source(
-            kernel_name, canonical, outer_idx, diff_idx,
+        # ``hoisted`` are the vectors, such as ``np.cos(Va)``, that follow
+        # them and that the caller computes once per call (issue #183). The
+        # kernel evaluates the canonical expression with the sine and cosine
+        # of a Var difference expanded unless ``expand_trig`` is False; the
+        # pattern above is that of the expression as derived.
+        self.expand_trig = bool(expand_trig)
+        kernel_canonical = (expand_trig_differences(canonical, var_map)
+                            if self.expand_trig else canonical)
+        (self.kernel_source, self.helper_sources, self.point_pos_arrays,
+         self.hoisted) = build_loop_jac_kernel_source(
+            kernel_name, kernel_canonical, outer_idx, diff_idx,
             self._nnz, sorted_symbols, var_map,
             walker_names=self.walker_arg_names,
             row_arr=sparsity_row, col_arr=sparsity_col, csr_arrays=csr_arrays,
@@ -375,11 +385,15 @@ class LoopEqnDiff(EqnDiff):
 
         _walker_arrays = tuple(csr_arrays[nm] for nm in self.walker_arg_names)
         _pos_arrays = tuple(self.point_pos_arrays)
+        # each hoisted vector as the NumPy function and the position of its
+        # Var among the kernel's arguments
+        _hoist = tuple((getattr(np, np_func.rsplit('.', 1)[-1]), sorted_symbols.index(var))
+                       for np_func, var in self.hoisted.values())
 
         def _kernel_wrapper(*args, _raw=raw_kernel_func,
                              _r=_row_arr, _c=_col_arr, _w=_walker_arrays,
-                             _p=_pos_arrays):
-            return _raw(*args, _r, _c, *_w, *_p)
+                             _p=_pos_arrays, _h=_hoist):
+            return _raw(*args, _r, _c, *_w, *_p, *[f(args[k]) for f, k in _h])
 
         _kernel_wrapper._kernel_source = self.kernel_source
         kernel_func = _kernel_wrapper
@@ -1032,6 +1046,15 @@ class LoopEqn(Eqn):
         Legacy API. Maps each ``sympy.IndexedBase`` name in ``body``
         to the corresponding Solverz ``Var`` / ``Param`` instance.
         Mutually exclusive with ``model``.
+    expand_trig : bool, default True
+        Evaluate ``cos(X[p] - X[q])`` and ``sin(X[p] - X[q])`` of a Var
+        ``X`` in the generated code as ``cos X[p] cos X[q] + sin X[p]
+        sin X[q]`` and ``sin X[p] cos X[q] - cos X[p] sin X[q]``. The
+        sine and cosine of each entry are then computed once per call,
+        and no trigonometric function is evaluated per stored entry of a
+        ``Sum``. The residual and the Jacobian change at the level of
+        rounding; pass ``False`` to keep the difference. The symbolic
+        body and its derivatives are not rewritten. See issue #183.
 
     Examples
     --------
@@ -1080,7 +1103,8 @@ class LoopEqn(Eqn):
                  n_outer: int = None,
                  var_map: Dict[str, object] = None,
                  model=None,
-                 outer=None):
+                 outer=None,
+                 expand_trig: bool = True):
         if not isinstance(name, str):
             raise ValueError("Equation name must be string!")
         # ``outer=IndexSet`` is an optional forward declaration of the set
@@ -1183,6 +1207,9 @@ class LoopEqn(Eqn):
         self.body = body
         self.var_map = dict(var_map)
         self.source = None  # see Eqn.source; LoopEqn bypasses Eqn.__init__
+        # Whether the generated code expands the sine and cosine of a
+        # difference of two entries of a Var, see ``expand_trig`` above.
+        self.expand_trig = bool(expand_trig)
 
         # Build SYMBOLS — what the model assembler uses to discover
         # the Var / Param dependencies of this equation. Maps the
@@ -1457,19 +1484,26 @@ class LoopEqn(Eqn):
         arg_names = sorted(self.SYMBOLS.keys())
         outer_idx_name = self.outer_index.name
 
+        hoisted: Dict[str, tuple] = {}
         state = {
             'acc_counter': 0,
             'prelude': [],
             'var_map': self.var_map,
             'outer_name': outer_idx_name,
             'sparse_walker_ctx': None,
+            'hoist': _hoisting(self.var_map, hoisted),
         }
-        body_expr = _translate_loop_body_njit(self.body, state)
+        body_expr = _translate_loop_body_njit(self._kernel_body(), state)
+        # the vectors of ``hoisted_vectors``, which this function computes
+        # itself, and which ``inner_F`` computes for ``inner_F<N>``
+        self._hoisted = hoisted
 
         indent = '    '
         inner_indent = indent * 2
-        lines = [
-            f"def _loop_eqn_func({', '.join(arg_names)}):",
+        lines = [f"def _loop_eqn_func({', '.join(arg_names)}):"]
+        lines += [f"{indent}{name} = {np_func}({var})"
+                  for name, (np_func, var) in hoisted.items()]
+        lines += [
             f"{indent}out = np.empty({self.n_outer})",
             f"{indent}for {outer_idx_name} in range({self.n_outer}):",
         ]
@@ -1555,6 +1589,23 @@ class LoopEqn(Eqn):
                 for part in ('data', 'indices', 'indptr')
                 if not numba_freezes(self._sparse_csr[nm][part])]
 
+    def _kernel_body(self):
+        """The body the generated code evaluates: :attr:`body`, with the sine
+        and cosine of a difference of two entries of a Var expanded unless
+        ``expand_trig`` is False (issue #183)."""
+        if self.expand_trig:
+            return expand_trig_differences(self.body, self.var_map)
+        return self.body
+
+    def hoisted_vectors(self) -> Dict[str, tuple]:
+        """The vectors that this LoopEqn's ``inner_F<N>`` reads, name →
+        ``(np_func, var)``, such as ``'_sz_h_cos_Va': ('np.cos', 'Va')``.
+        ``inner_F`` computes each one as ``np_func(var)`` once per call and
+        passes them after :meth:`walker_arg_names`, so a transcendental
+        function of a Var entry is evaluated once per entry and not once per
+        use (issue #183)."""
+        return dict(self._hoisted)
+
     def print_njit_source(self, func_name: str) -> str:
         """Return Numba-compatible Python source for an ``inner_F<N>``
         sub-function that evaluates this LoopEqn.
@@ -1591,10 +1642,10 @@ class LoopEqn(Eqn):
         to emit explicit nested ``for`` loops.
         """
         walker_args = self.walker_arg_names()
-        arg_names = self.njit_arg_names() + walker_args
         outer_name = self.outer_index.name
         n_outer = self.n_outer
 
+        hoisted: Dict[str, tuple] = {}
         state = {
             'acc_counter': 0,
             'prelude': [],
@@ -1602,8 +1653,14 @@ class LoopEqn(Eqn):
             'outer_name': outer_name,
             'sparse_walker_ctx': None,
             'walker_args': frozenset(walker_args),
+            'hoist': _hoisting(self.var_map, hoisted),
         }
-        body_expr = _translate_loop_body_njit(self.body, state)
+        body_expr = _translate_loop_body_njit(self._kernel_body(), state)
+        if list(hoisted) != list(self._hoisted):
+            # the call in ``inner_F`` passes ``hoisted_vectors``
+            raise RuntimeError(f"LoopEqn {self.name!r}: the module reads the vectors "
+                               f"{list(hoisted)}, but inner_F computes {list(self._hoisted)}")
+        arg_names = self.njit_arg_names() + walker_args + list(hoisted)
 
         indent = '    '
         inner_indent = indent * 2
@@ -1717,6 +1774,7 @@ class LoopEqn(Eqn):
                     n_outer=self.n_outer,
                     n_diff=n_diff,
                     var_map=self.var_map,
+                    expand_trig=self.expand_trig,
                 )
                 self.derivatives[var_iVar.name] = ed
                 continue
@@ -2307,6 +2365,19 @@ def _translate_loop_body_njit(expr, state) -> str:
         fname = expr.func.__name__
         mapped = _FUNCTION_NUMPY_MAP.get(fname)
         if mapped is not None:
+            # A transcendental function of one entry of a Var reads that
+            # entry of a vector which the caller computes once per call,
+            # instead of being evaluated wherever the body reads it, which
+            # inside a Sum is once per stored entry (issue #183). The vector
+            # holds the same numbers, so the result is unchanged.
+            hoist = state.get('hoist')
+            arg = expr.args[0] if len(expr.args) == 1 else None
+            if (hoist is not None and fname in _HOISTED_FUNCTIONS
+                    and isinstance(arg, sp.Indexed) and len(arg.indices) == 1):
+                vector = hoist(mapped, arg.base.name)
+                if vector is not None:
+                    index_code = _translate_loop_body_njit(arg.indices[0], state)
+                    return f"{vector}[{index_code}]"
             args_code = [_translate_loop_body_njit(a, state)
                          for a in expr.args]
             return f"{mapped}({', '.join(args_code)})"
@@ -2361,6 +2432,79 @@ _FUNCTION_NUMPY_MAP = {
     'heaviside': 'SolCF.Heaviside',
     'Heaviside': 'SolCF.Heaviside',
 }
+
+# The functions whose value at an entry of a Var a LoopEqn kernel reads from a
+# vector computed once per call (issue #183): the transcendental ones, which
+# cost far more than the load that replaces them.
+_HOISTED_FUNCTIONS = frozenset({'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'exp', 'log', 'ln'})
+
+
+def _hoisting(var_map, vectors: Dict[str, tuple]):
+    """The ``hoist`` callback of :func:`_translate_loop_body_njit`.
+
+    ``hoist(np_func, base_name)`` returns the name of the vector that holds
+    ``np_func`` of every entry of the 1-D Var ``base_name`` and records it in
+    ``vectors`` as name → ``(np_func, base_name)``, or returns None when
+    ``base_name`` is not such a Var. The caller of the generated function
+    computes every recorded vector once per evaluation, as
+    ``np_func(base_name)``, and passes it on (issue #183).
+    """
+    from Solverz.variable.ssymbol import Var
+
+    def hoist(np_func, base_name):
+        obj = var_map.get(base_name)
+        if not isinstance(obj, Var) or np.ndim(obj.value) != 1:
+            return None
+        name = f"_sz_h_{np_func.rsplit('.', 1)[-1]}_{base_name}"
+        vectors.setdefault(name, (np_func, base_name))
+        return name
+    return hoist
+
+
+def expand_trig_differences(expr, var_map):
+    """Rewrite ``cos(X[p] - X[q])`` as ``cos X[p] cos X[q] + sin X[p] sin X[q]``
+    and ``sin(X[p] - X[q])`` as ``sin X[p] cos X[q] - cos X[p] sin X[q]``,
+    wherever ``X`` is a Var of ``var_map`` (issue #183).
+
+    The generated code then evaluates the sine and cosine of single entries,
+    which it reads from vectors computed once per call, and no trigonometric
+    function per stored entry of a ``Sum``. The values change at the level of
+    rounding. Any other argument, such as a difference of two Vars or of a Var
+    and a Param, is left as it is. Both SymPy's and Solverz's ``sin`` and
+    ``cos`` are rewritten, each into functions of its own kind.
+    """
+    from Solverz.variable.ssymbol import Var
+    from Solverz.sym_algebra.functions import cos as sol_cos, sin as sol_sin
+
+    kinds = {sp.sin: (sp.sin, sp.cos), sp.cos: (sp.sin, sp.cos),
+             sol_sin: (sol_sin, sol_cos), sol_cos: (sol_sin, sol_cos)}
+
+    def difference(arg):
+        if not isinstance(arg, sp.Add) or len(arg.args) != 2:
+            return None
+        plus = [a for a in arg.args if isinstance(a, sp.Indexed)]
+        minus = [a.args[1] for a in arg.args
+                 if isinstance(a, sp.Mul) and len(a.args) == 2
+                 and a.args[0] == -1 and isinstance(a.args[1], sp.Indexed)]
+        if len(plus) != 1 or len(minus) != 1:
+            return None
+        p, q = plus[0], minus[0]
+        if (p.base != q.base or len(p.indices) != 1 or len(q.indices) != 1
+                or not isinstance(var_map.get(p.base.name), Var)):
+            return None
+        return p, q
+
+    def is_difference(e):
+        return type(e) in kinds and len(e.args) == 1 and difference(e.args[0]) is not None
+
+    def expand(e):
+        s, c = kinds[type(e)]
+        p, q = difference(e.args[0])
+        if type(e) is c:
+            return c(p) * c(q) + s(p) * s(q)
+        return s(p) * c(q) - c(p) * s(q)
+
+    return expr.replace(is_difference, expand)
 
 
 class Ode(Eqn):
@@ -2433,7 +2577,7 @@ class LoopOde(LoopEqn, Ode):
     diff_var : iVar / IdxVar / Var
         The state-Var slice being differentiated in time. Its
         runtime length must match ``n_outer``.
-    model, var_map, n_outer : same as LoopEqn.
+    model, var_map, n_outer, expand_trig : same as LoopEqn.
     """
 
     def __init__(self,
@@ -2444,7 +2588,8 @@ class LoopOde(LoopEqn, Ode):
                  n_outer: int = None,
                  model=None,
                  var_map=None,
-                 outer=None):
+                 outer=None,
+                 expand_trig: bool = True):
         # Defer to LoopEqn.__init__ for all the body rewriting,
         # var_map inference, sparse-walker collection, SYMBOLS
         # assembly, and NUM_EQN building. After it returns, ``self``
@@ -2456,7 +2601,8 @@ class LoopOde(LoopEqn, Ode):
                          n_outer=n_outer,
                          model=model,
                          var_map=var_map,
-                         outer=outer)
+                         outer=outer,
+                         expand_trig=expand_trig)
         # Overwrite ``LHS`` with the time-derivative expression so
         # Solverz treats ``self`` like any other ``Ode`` during DAE
         # partitioning. ``diff_var`` is stashed for ``eval_lhs`` and

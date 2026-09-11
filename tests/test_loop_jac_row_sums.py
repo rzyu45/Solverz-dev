@@ -190,9 +190,10 @@ def test_entry_that_depends_on_a_sum_dummy_keeps_the_search():
         csr_arrays[f'_sz_csr_{nm}_indices'] = np.ascontiguousarray(csr.indices, dtype=np.int64)
         csr_arrays[f'_sz_csr_{nm}_indptr'] = np.ascontiguousarray(csr.indptr, dtype=np.int64)
 
-    src, helpers, positions = build_loop_jac_kernel_source(
+    src, helpers, positions, hoisted = build_loop_jac_kernel_source(
         'kernel', canonical, i, k, rows.size, ['x'], var_map,
         row_arr=rows, col_arr=cols, csr_arrays=csr_arrays)
+    assert hoisted == {}
     assert len(positions) == 1 and (positions[0] < 0).any()
     assert '_sz_csr_A_point' not in src
     assert '_sz_csr_B_point(j, k)' in src
@@ -205,7 +206,7 @@ def test_entry_that_depends_on_a_sum_dummy_keeps_the_search():
     expected = xv[:, None] * dense_a + dense_a @ (xv[:, None] * dense_b)
     np.testing.assert_allclose(ns['kernel'](xv, rows, cols, *positions), expected.ravel(), rtol=1e-14, atol=1e-14)
 
-    old_src, old_helpers, old_positions = build_loop_jac_kernel_source(
+    old_src, old_helpers, old_positions, _ = build_loop_jac_kernel_source(
         'kernel', canonical, i, k, rows.size, ['x'], var_map)
     assert old_positions == []
     assert '_sz_csr_A_point(i, k)' in old_src and '_sz_csr_B_point(j, k)' in old_src

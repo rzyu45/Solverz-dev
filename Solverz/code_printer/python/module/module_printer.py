@@ -282,6 +282,20 @@ def print_J(eqs_type: str,
     return pycode(fd, fully_qualified_modules=False)
 
 
+def _print_hoisted_vectors(vectors, arg_names, where: str):
+    """``<name> = <np_func>(<var>)`` for every vector, name → ``(np_func,
+    var)``, that the LoopEqn functions called by the dispatcher ``where``
+    read, so that each is computed once per call for all of them (issue
+    #183)."""
+    missing = sorted({var for _, var in vectors.values()} - set(arg_names))
+    if missing:
+        raise RuntimeError(f"{where} does not receive {missing}, "
+                           f"whose vectors its LoopEqn functions read")
+    return [Assignment(iVar(name, internal_use=True),
+                       FunctionCall(np_func, [symbols(var, real=True)]))
+            for name, (np_func, var) in vectors.items()]
+
+
 def print_inner_J(var_addr: Address,
                   PARAM: Dict[str, ParamBase],
                   jac: Jac,
@@ -381,6 +395,7 @@ def print_inner_J(var_addr: Address,
                         'col_key': col_key,
                         'walker_args': list(ed.walker_arg_names),
                         'pos_keys': pos_keys,
+                        'hoisted': dict(ed.hoisted),
                         # the row / col and position arrays that inner_J must
                         # receive as arguments, like the walker arrays above
                         'row_col_args': [key for key in (row_key, col_key)
@@ -500,9 +515,13 @@ def print_inner_J(var_addr: Address,
     # other one stays a global, which Numba compiles to a constant and
     # still caches (issue #170).
     extra_names = []
-    for mb in mutable_matrix_blocks:
-        if mb.get('mode') != 'loop_eqn':
-            continue
+    loop_blocks = [mb for mb in mutable_matrix_blocks if mb.get('mode') == 'loop_eqn']
+    # The vectors the kernels read, such as ``np.cos(Va)``, computed once per
+    # call for all of them (issue #183).
+    body.extend(_print_hoisted_vectors(
+        {name: spec for mb in loop_blocks for name, spec in mb['hoisted'].items()},
+        [a.name for a in args], 'inner_J'))
+    for mb in loop_blocks:
         for nm in list(mb['row_col_args']) + list(mb['walker_args']) + list(mb['pos_args']):
             if nm not in extra_names:
                 extra_names.append(nm)
@@ -510,13 +529,14 @@ def print_inner_J(var_addr: Address,
                        for nm in mb['kernel_symbols']]
         walker_syms = [symbols(nm, real=True) for nm in mb['walker_args']]
         pos_syms = [symbols(nm, real=True) for nm in mb['pos_keys']]
+        hoist_syms = [symbols(nm, real=True) for nm in mb['hoisted']]
         row_sym = symbols(mb['row_key'], real=True)
         col_sym = symbols(mb['col_key'], real=True)
         body.append(Assignment(
             iVar('_data_', internal_use=True)[mb['addr_slice']],
             FunctionCall(
                 mb['kernel_fn_name'],
-                kernel_args + [row_sym, col_sym] + walker_syms + pos_syms,
+                kernel_args + [row_sym, col_sym] + walker_syms + pos_syms + hoist_syms,
             ),
         ))
 
@@ -1274,6 +1294,13 @@ def print_inner_F(EQNs: Dict[str, Eqn],
                  symbols(f'{mat_name}_shape0', real=True),
                  operand_arg])))
 
+    # The vectors the LoopEqn sub-functions read, such as ``np.cos(Va)``,
+    # computed once per call for all of them (issue #183).
+    body.extend(_print_hoisted_vectors(
+        {name: spec for eqn in EQNs.values() if isinstance(eqn, LoopEqn)
+         for name, spec in eqn.hoisted_vectors().items()},
+        [a.name for a in args], 'inner_F'))
+
     body.extend(print_eqn_assignment_with_precompute(EQNs,
                                                      EqnAddr,
                                                      precompute_info))
@@ -1311,9 +1338,11 @@ def print_eqn_assignment_with_precompute(EQNs, EqnAddr, precompute_info):
             sub_args = [symbols(a.name, real=True) for a in eqn_info['args']]
         elif isinstance(eqn, LoopEqn):
             # Exclude sparse walker Params; their CSR arrays follow, the
-            # ones Numba would not freeze, see ``walker_arg_names``.
+            # ones Numba would not freeze, see ``walker_arg_names``, and
+            # then the vectors computed above, see ``hoisted_vectors``.
             sub_args = ([eqn.SYMBOLS[nm] for nm in eqn.njit_arg_names()]
-                        + [symbols(w, real=True) for w in eqn.walker_arg_names()])
+                        + [symbols(w, real=True) for w in eqn.walker_arg_names()]
+                        + [symbols(h, real=True) for h in eqn.hoisted_vectors()])
         else:
             # Preserve original behavior for non-matrix equations
             sub_args = list(eqn.SYMBOLS.values())
@@ -1365,7 +1394,7 @@ def print_sub_inner_F(EQNs: Dict[str, Eqn]):
             # module-level constants injected via ``mut_mat_mappings`` by
             # ``render_modules``; the ones Numba would not freeze are
             # passed in as well, see ``LoopEqn.walker_arg_names``.
-            arg_names = eqn.njit_arg_names() + eqn.walker_arg_names()
+            arg_names = eqn.njit_arg_names() + eqn.walker_arg_names() + list(eqn.hoisted_vectors())
             args = [symbols(v, real=True) for v in arg_names]
             _doc = f"{eqn_name}{format_source(getattr(eqn, 'source', None))}"
             code_blocks.append(_with_docstring(
