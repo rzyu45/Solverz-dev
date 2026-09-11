@@ -84,11 +84,42 @@ def _references_index(expr, idx) -> bool:
                for sym in expr.free_symbols)
 
 
-def check_canonical_invariants(canonical: sp.Expr,
-                                eqn_name: str = '',
-                                var_name: str = '') -> List[str]:
-    """Report two states of a canonical Jacobian expression that mean a
-    defect upstream. They differ in severity, and the messages say so.
+class UnsoundLoopJacobianError(RuntimeError):
+    """A canonical ``LoopEqn`` Jacobian is in a state that
+    :func:`canonical_problems` reports. ``problems`` lists the states and
+    ``canonical`` is the expression that carries them.
+
+    It derives from ``RuntimeError`` because both states are defects
+    inside Solverz, not bad input, so an ``except ValueError`` written for
+    bad input does not swallow it (issue #177).
+    """
+
+    def __init__(self, problems: List[str], canonical: sp.Expr, where: str = ''):
+        self.problems = list(problems)
+        self.canonical = canonical
+        # Only the escaped dummy makes the Jacobian wrong. Say which this
+        # is, so an error about the milder state does not claim that the
+        # result would have been wrong.
+        wrong = any('outside every Sum' in x for x in self.problems)
+        severity = (
+            "The generated Jacobian would be wrong, not merely over-reserved."
+            if wrong else
+            "The Jacobian would be assembled by label, which is correct only "
+            "if the indices sharing a label denote the same thing, and that "
+            "is not checked here."
+        )
+        super().__init__(
+            "LoopEqn canonical Jacobian is structurally unsound"
+            + (f" for {where}" if where else "")
+            + f". {severity} "
+            + "; ".join(self.problems)
+            + f". Canonical: {canonical}")
+
+
+def canonical_problems(canonical: sp.Expr) -> List[str]:
+    """Describe the states of a canonical Jacobian expression that mean a
+    defect upstream, or return an empty list when the expression is sound.
+    :func:`check_canonical_invariants` raises on any of them.
 
     1. **Two free symbols share a printed name.** Every structural test
        in this module compares indices by label, so it reads the two as
@@ -105,11 +136,6 @@ def check_canonical_invariants(canonical: sp.Expr,
        and the generated kernel then reads whatever value the loop
        variable last held. This one does make the Jacobian wrong, and
        finitely so, which is why nothing downstream notices.
-
-    Returns the list of problem descriptions, empty when the expression
-    is sound. Callers warn rather than raise, so a model that hits
-    either still runs and can be checked against a finite-difference
-    Jacobian.
     """
     problems: List[str] = []
 
@@ -147,26 +173,27 @@ def check_canonical_invariants(canonical: sp.Expr,
                         f"was lifted out of "
                         f"Sum(..., {tuple(node.limits[0])})")
 
+    return problems
+
+
+def check_canonical_invariants(canonical: sp.Expr,
+                                eqn_name: str = '',
+                                var_name: str = '') -> List[str]:
+    """Raise :class:`UnsoundLoopJacobianError` when
+    :func:`canonical_problems` finds either state, and return the empty
+    list otherwise.
+
+    It warned until 0.11.1, so that a model in either state still ran and
+    could be compared with a finite-difference Jacobian. Either state was
+    reachable then, because one model's symbols could reach another's
+    (issues #168 and #175). With both fixed nothing reaches it, and a
+    model that does now fails where the defect is instead of running on a
+    wrong Jacobian (issue #177).
+    """
+    problems = canonical_problems(canonical)
     if problems:
         where = ' '.join(x for x in (eqn_name, var_name) if x)
-        # Only the escaped dummy makes the Jacobian wrong. Say which
-        # this is, so a warning about the milder state does not read as
-        # an alarm about a result that is in fact correct.
-        wrong = any('outside every Sum' in x for x in problems)
-        severity = (
-            "The generated Jacobian is wrong, not merely over-reserved."
-            if wrong else
-            "The Jacobian is still assembled by label, so it is correct as "
-            "long as the indices sharing a label denote the same thing, "
-            "which is not checked here."
-        )
-        warnings.warn(
-            "LoopEqn canonical Jacobian is structurally unsound"
-            + (f" for {where}" if where else "")
-            + f". {severity} "
-            + "; ".join(problems)
-            + f". Canonical: {canonical}",
-            stacklevel=3)
+        raise UnsoundLoopJacobianError(problems, canonical, where)
     return problems
 
 

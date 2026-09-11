@@ -1650,6 +1650,7 @@ class LoopEqn(Eqn):
         """
         from Solverz.variable.ssymbol import Var
         from Solverz.equation.loop_jac import (
+            UnsoundLoopJacobianError,
             canonicalize_kronecker,
             loop_jac_to_solverz_expr,
         )
@@ -1671,9 +1672,16 @@ class LoopEqn(Eqn):
             if is_zero(raw_deriv):
                 continue
 
-            canonical = canonicalize_kronecker(
-                raw_deriv, self.outer_index, k
-            )
+            try:
+                canonical = canonicalize_kronecker(
+                    raw_deriv, self.outer_index, k
+                )
+            except UnsoundLoopJacobianError as err:
+                # The check runs deep inside the canonicalization, where
+                # the equation and the variable are unknown. Name them.
+                raise UnsoundLoopJacobianError(
+                    err.problems, err.canonical,
+                    f'{self.name} w.r.t. {var_iVar.name}') from None
             if is_zero(canonical):
                 continue
 

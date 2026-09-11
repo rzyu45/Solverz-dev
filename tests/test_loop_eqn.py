@@ -2932,15 +2932,13 @@ def test_issue151_plain_idx_shorter_than_param_rows_linear_body():
 def _assert_canonical_sane(name, canonical):
     """Delegate to the production invariant check so the test and the
     library can never drift apart. See
-    ``Solverz.equation.loop_jac.check_canonical_invariants`` for what the
-    two invariants are and why violating either yields a Jacobian that is
+    ``Solverz.equation.loop_jac.canonical_problems`` for what the two
+    invariants are and why violating either yields a Jacobian that is
     wrong rather than merely over-reserved.
     """
-    from Solverz.equation.loop_jac import check_canonical_invariants
+    from Solverz.equation.loop_jac import canonical_problems
 
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        problems = check_canonical_invariants(canonical)
+    problems = canonical_problems(canonical)
     assert not problems, f"{name}: " + "; ".join(problems)
 
 
@@ -3145,8 +3143,7 @@ def test_loop_eqn_polar_pf_survives_a_mismatched_sum_dummy_object():
         warnings.simplefilter('always')
         spf, y0 = m.create_instance()
     bad = [str(w.message) for w in caught
-           if 'dense fallback' in str(w.message)
-           or 'structurally unsound' in str(w.message)]
+           if 'dense fallback' in str(w.message)]
     assert not bad, " | ".join(bad)
 
     for eqn_name in ('P_eqn', 'Q_eqn'):
@@ -3183,9 +3180,10 @@ def test_loop_eqn_polar_pf_survives_a_mismatched_sum_dummy_object():
     np.testing.assert_allclose(sol.y['Va'], Va_t, atol=1e-8)
 
 
-def test_check_canonical_invariants_reports_a_lifted_delta():
-    """The guard must speak on the two states it exists for, and stay
-    silent on the shapes a sound canonicalisation legitimately produces.
+def test_check_canonical_invariants_raises_on_a_lifted_delta():
+    """The guard must stop the build on the two states it exists for, and
+    stay silent on the shapes a sound canonicalisation legitimately
+    produces (issue #177).
 
     A ``KroneckerDelta`` naming a ``Sum``'s dummy from OUTSIDE that
     ``Sum`` is the shape the cookbook CI produced. It is not a slow
@@ -3194,9 +3192,12 @@ def test_check_canonical_invariants_reports_a_lifted_delta():
     index rather than the dummy is the legitimate pulled-out form and
     must not be reported.
     """
+    import pytest
     from sympy.functions.special.tensor_functions import KroneckerDelta
 
-    from Solverz.equation.loop_jac import check_canonical_invariants
+    from Solverz.equation.loop_jac import (UnsoundLoopJacobianError,
+                                           canonical_problems,
+                                           check_canonical_invariants)
 
     k = sp.Idx('_sz_loop_dk')
     i = sp.Idx('i', 6)
@@ -3204,15 +3205,16 @@ def test_check_canonical_invariants_reports_a_lifted_delta():
     f = sp.IndexedBase('f')
 
     sound = KroneckerDelta(k, i) * sp.Sum(f[j], (j, 0, 5))
+    assert canonical_problems(sound) == []
     assert check_canonical_invariants(sound) == []
 
     lifted = KroneckerDelta(k, j) * sp.Sum(f[j], (j, 0, 5))
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter('always')
-        problems = check_canonical_invariants(lifted, 'eqn', 'x')
-    assert len(problems) == 1
-    assert 'occurs outside every Sum' in problems[0]
-    assert any('structurally unsound' in str(w.message) for w in caught)
+    with pytest.raises(UnsoundLoopJacobianError,
+                       match='structurally unsound for eqn x') as info:
+        check_canonical_invariants(lifted, 'eqn', 'x')
+    assert len(info.value.problems) == 1
+    assert 'occurs outside every Sum' in info.value.problems[0]
+    assert 'would be wrong' in str(info.value)
 
     # Two objects of one label. Built the way Set.idx makes reachable:
     # a SetIdx and a plain Idx of the same name and bounds.
@@ -3220,9 +3222,7 @@ def test_check_canonical_invariants_reports_a_lifted_delta():
 
     j_set = IndexSet('S', 6).idx('j')
     twins = f[j_set] + f[j]
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        problems = check_canonical_invariants(twins)
+    problems = canonical_problems(twins)
     # The twin index and every Indexed built on it are both reported,
     # which is the pattern the cookbook CI showed: i_p twice and
     # PVPQ[i_p] twice in one expression.
@@ -3230,6 +3230,8 @@ def test_check_canonical_invariants_reports_a_lifted_delta():
     assert len(idx_problem) == 1
     assert 'SetIdx' in idx_problem[0] and 'Idx(' in idx_problem[0]
     assert any(x.startswith("index label 'f[j]'") for x in problems)
+    with pytest.raises(UnsoundLoopJacobianError, match='assembled by label'):
+        check_canonical_invariants(twins)
 
 
 def _sin_walker_module(tmp_path, name, G):
