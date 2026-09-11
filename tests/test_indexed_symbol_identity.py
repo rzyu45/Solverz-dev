@@ -6,9 +6,8 @@ does not print, namely the token of a ``Set`` index and the bounds of an
 share one cached instance. SymPy's caches, keyed on that equality, then handed
 a later model an expression that held an earlier model's index.
 """
-import warnings
-
 import numpy as np
+import pytest
 import sympy as sp
 from scipy.sparse import csc_array
 
@@ -61,6 +60,9 @@ def test_equality_follows_the_base_symbol():
     assert Para('A', dim=2)[0, 1] == Para('A', dim=2)[0, 1]
 
 
+# The ring has one equation per PQ bus and two variables per bus, which
+# create_instance reports; the size is not what this test checks.
+@pytest.mark.filterwarnings('ignore:Equation size')
 def test_loop_eqn_jacobian_after_a_symbol_cache_eviction():
     """The cookbook shape: two power-flow-shaped builds in one process, with
     enough symbols created in between to evict the first build's indexed
@@ -71,7 +73,7 @@ def test_loop_eqn_jacobian_after_a_symbol_cache_eviction():
         ring[k, (k + 1) % n] = ring[(k + 1) % n, k] = 1.0
         ring[k, k] = -2.0
 
-    def unsound_after_build():
+    def build():
         m = Model()
         m.Vm = Var('Vm', np.ones(n))
         m.Va = Var('Va', np.linspace(0.0, 0.2, n))
@@ -82,13 +84,11 @@ def test_loop_eqn_jacobian_after_a_symbol_cache_eviction():
         j = m.Bus.idx('j')
         body = m.Vm[i_q] * Sum(m.Vm[j] * m.Bbus[i_q, j] * sin(m.Va[i_q] - m.Va[j]), j)
         m.Q_eqn = LoopEqn('Q_eqn', outer_index=i_q, body=body, model=m)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter('always')
-            spf, y0 = m.create_instance()
-            spf.FormJac(y0)
-        return [str(w.message) for w in caught if 'structurally unsound' in str(w.message)]
+        # An unsound canonical Jacobian raises inside (issue #177).
+        spf, y0 = m.create_instance()
+        spf.FormJac(y0)
 
-    assert unsound_after_build() == []
+    build()
     for k in range((sp.core.cache.SYMPY_CACHE_SIZE or 0) + 100):
         sp.Symbol(f'_sz_evict_{k}')
-    assert unsound_after_build() == []
+    build()

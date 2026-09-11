@@ -2,6 +2,12 @@
 
 # Release Notes
 
+## 0.11.2
+
+### Changed
+
+- **A `LoopEqn` whose canonical Jacobian is structurally unsound now fails to build instead of warning.** `check_canonical_invariants` reports two states of a canonical `LoopEqn` Jacobian that always mean a defect upstream. One is two free symbols that share a printed name, which the analyzer, since it compares indices by label, reads as one index. The other is a `Sum` dummy that also occurs outside every `Sum`, which makes the generated Jacobian wrong. The check warned, so that a model in either state still ran and could be compared with a finite-difference Jacobian, and Newton or Rodas then ran on a Jacobian that could be wrong. Both states were reachable while one model's symbols could reach another's, and the fixes of [#168](https://github.com/smallbunnies/Solverz/issues/168) and [#175](https://github.com/smallbunnies/Solverz/issues/175) in 0.11.1 closed that path. Nothing in Solverz, SolMuseum or the Cookbook reaches either state, and their test suites pass with the warning turned into an error. The check now raises `UnsoundLoopJacobianError`, a `RuntimeError`, from `create_instance`, and the message names the equation and the variable. `canonical_problems` returns the same descriptions without raising. See [#177](https://github.com/smallbunnies/Solverz/issues/177).
+
 ## 0.11.1
 
 ### Fixed
