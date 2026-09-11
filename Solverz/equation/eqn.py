@@ -317,10 +317,14 @@ class LoopEqnDiff(EqnDiff):
         # one as a module-level global, which Numba compiles to a constant
         # and still caches (issue #170).
         self.walker_arg_names = [w for w in walker_names if not numba_freezes(csr_arrays[w])]
-        self.kernel_source, self.helper_sources = build_loop_jac_kernel_source(
+        # ``point_pos_arrays`` hold, for each nonzero, the position in the CSR
+        # data of a sparse Param of the entry the kernel reads there. They
+        # follow the walker arrays in the kernel's signature (issue #179).
+        self.kernel_source, self.helper_sources, self.point_pos_arrays = build_loop_jac_kernel_source(
             kernel_name, canonical, outer_idx, diff_idx,
             self._nnz, sorted_symbols, var_map,
             walker_names=self.walker_arg_names,
+            row_arr=sparsity_row, col_arr=sparsity_col, csr_arrays=csr_arrays,
         )
 
         # exec the source into a namespace with the numpy + SolCF
@@ -369,10 +373,12 @@ class LoopEqnDiff(EqnDiff):
         _col_arr = self._sparsity_col
 
         _walker_arrays = tuple(csr_arrays[nm] for nm in self.walker_arg_names)
+        _pos_arrays = tuple(self.point_pos_arrays)
 
         def _kernel_wrapper(*args, _raw=raw_kernel_func,
-                             _r=_row_arr, _c=_col_arr, _w=_walker_arrays):
-            return _raw(*args, _r, _c, *_w)
+                             _r=_row_arr, _c=_col_arr, _w=_walker_arrays,
+                             _p=_pos_arrays):
+            return _raw(*args, _r, _c, *_w, *_p)
 
         _kernel_wrapper._kernel_source = self.kernel_source
         kernel_func = _kernel_wrapper
@@ -2169,8 +2175,20 @@ def _translate_loop_body_njit(expr, state) -> str:
             else:
                 other_factors.append(a)
         if delta_factors and other_factors:
-            other_parts = [_translate_loop_body_njit(a, state)
-                           for a in other_factors]
+            # The product is zero unless every delta holds, so the Sums
+            # among the other factors get a prelude of their own that runs
+            # only under the delta condition. Otherwise a sparse Jacobian
+            # kernel walks the whole row at every nonzero of the row, to use
+            # the result at the one nonzero where the delta holds (issue
+            # #179). The expression returned is unchanged, and so are the
+            # values it computes.
+            outer_prelude, first_acc = state['prelude'], state['acc_counter']
+            state['prelude'] = []
+            try:
+                other_parts = [_translate_loop_body_njit(a, state)
+                               for a in other_factors]
+            finally:
+                guarded, state['prelude'] = state['prelude'], outer_prelude
             other_code = " * ".join(other_parts)
             conds = []
             for d in delta_factors:
@@ -2178,6 +2196,16 @@ def _translate_loop_body_njit(expr, state) -> str:
                 bc = _translate_loop_body_njit(d.args[1], state)
                 conds.append(f"{ac} == {bc}")
             cond_code = " and ".join(conds)
+            if guarded:
+                outer_prelude.append(f"if {cond_code}:")
+                outer_prelude.extend(f"    {stmt}" for stmt in guarded)
+                # The expression reads these accumulators only where the
+                # condition holds, but Numba needs them bound on both paths.
+                accs = [f"_sz_loop_acc_{n}"
+                        for n in range(first_acc, state['acc_counter'])]
+                if accs:
+                    outer_prelude.append("else:")
+                    outer_prelude.extend(f"    {acc} = 0.0" for acc in accs)
             return f"(({other_code}) if {cond_code} else 0.0)"
         parts = [_translate_loop_body_njit(a, state) for a in expr.args]
         return "(" + " * ".join(parts) + ")"
@@ -2232,6 +2260,17 @@ def _translate_loop_body_njit(expr, state) -> str:
                     expr.indices[0], state)
                 col_code = _translate_loop_body_njit(
                     expr.indices[1], state)
+                # A sparse Jacobian kernel knows the row and the column of
+                # every nonzero it evaluates, so it can read the entry at a
+                # position computed when the pattern is built instead of
+                # searching the row for it (issue #179). ``point_position``
+                # returns None where the entry does not follow from the
+                # nonzero alone, and the search helper is used there.
+                point_position = state.get('point_position')
+                if point_position is not None:
+                    code = point_position(base_name, row_code, col_code)
+                    if code is not None:
+                        return code
                 state.setdefault('sparse_point_helpers', set()).add(
                     base_name)
                 call_args = [row_code, col_code] + _csr_point_args(

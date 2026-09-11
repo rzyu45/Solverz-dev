@@ -2169,7 +2169,10 @@ def build_loop_jac_kernel_source(func_name: str,
                                    var_map: Dict[str, object],
                                    row_arr_param: str = '_sz_row_arr',
                                    col_arr_param: str = '_sz_col_arr',
-                                   walker_names=()) -> str:
+                                   walker_names=(),
+                                   row_arr=None,
+                                   col_arr=None,
+                                   csr_arrays=None):
     """Generate Python source for a **sparse** LoopEqn Jacobian
     block kernel.
 
@@ -2212,8 +2215,8 @@ def build_loop_jac_kernel_source(func_name: str,
         the ``range(nnz)`` loop.
     symbols_list : list of str
         Sorted Var/Param names that flow in as function arguments
-        BEFORE the row / col arrays. The full signature is
-        ``(<symbols>, <row_arr_param>, <col_arr_param>)``.
+        BEFORE the row / col arrays. The full signature is given
+        under Returns.
     var_map : dict
         IndexedBase name → Solverz Var/Param (passed through to
         ``_translate_loop_body_njit`` for the sparse-walker
@@ -2230,14 +2233,36 @@ def build_loop_jac_kernel_source(func_name: str,
         disables Numba's cache (issue #162). The kernel and the helpers
         read every other CSR array as a module-level global, which Numba
         compiles to a constant (issue #170).
+    row_arr, col_arr : ndarray of int, optional
+        The row and the column of each of the ``nnz`` positions, in the
+        order in which the kernel receives them. Together with
+        ``csr_arrays`` they let the kernel read an entry ``M[row, col]``
+        of a sparse 2-D Param, whose row and column follow from the
+        position alone, at a position in the CSR data of ``M`` computed
+        here, instead of searching row ``row`` of ``M`` at every call
+        (issue #179). Without them every such entry is read through the
+        search helper ``_sz_csr_<M>_point``.
+    csr_arrays : dict, optional
+        ``_sz_csr_<M>_data`` / ``_indices`` / ``_indptr`` → the array, for
+        the sparse 2-D Params of ``var_map``.
 
     Returns
     -------
-    str
+    kernel_source : str
         Full Python source for the kernel function, including the
         ``def`` line and a trailing newline. Ready to ``exec`` (for
         the inline path) or to ``@njit(cache=True)``-decorate and
-        paste into a module file (for the JIT path).
+        paste into a module file (for the JIT path). Its signature is
+        ``(<symbols>, <row_arr_param>, <col_arr_param>, <walker_names>,
+        _sz_pos_0, _sz_pos_1, ...)``.
+    helper_sources : list of str
+        The sources of the ``_sz_csr_<M>_point`` search helpers that the
+        kernel calls.
+    point_positions : list of ndarray
+        One ``int64`` array of length ``nnz`` for each ``_sz_pos_<n>``
+        argument: the position of the entry the kernel reads in the CSR
+        data of its Param, or -1 where the Param stores no entry, which
+        reads as 0.0 as it does through the search helper.
     """
     from Solverz.equation.eqn import _csr_point_args, _translate_loop_body_njit
 
@@ -2247,6 +2272,51 @@ def build_loop_jac_kernel_source(func_name: str,
     indent = '    '
     body_indent = indent * 2
 
+    # Shared by every state below, so that the search helpers and the
+    # position arrays of the per-delta branches reach the kernel as well.
+    point_helpers: set = set()
+    point_positions: List[np.ndarray] = []
+    point_codes: Dict[Tuple[str, str, str], object] = {}
+    index_values = None
+    if row_arr is not None and col_arr is not None and csr_arrays is not None:
+        # An index expression of the body is evaluated at every position
+        # against the outer and the diff index there and against the
+        # integer Params, which determine the pattern as the body does.
+        from Solverz.equation.param import ParamBase
+        index_values = {outer_name: np.asarray(row_arr, dtype=np.int64),
+                        diff_name: np.asarray(col_arr, dtype=np.int64)}
+        for nm, obj in var_map.items():
+            if (isinstance(obj, ParamBase)
+                    and not getattr(obj, 'triggerable', False)
+                    and not getattr(obj, 'sparse', False)
+                    and obj.v is not None):
+                value = np.asarray(obj.v)
+                if np.issubdtype(value.dtype, np.integer):
+                    index_values.setdefault(nm, value)
+
+    def _point_position(base_name, row_code, col_code):
+        key = (base_name, row_code, col_code)
+        if key in point_codes:
+            return point_codes[key]
+        code = None
+        rows = _eval_index_code(row_code, index_values, nnz)
+        cols = _eval_index_code(col_code, index_values, nnz)
+        shape = getattr(getattr(var_map.get(base_name), 'v', None), 'shape', None)
+        data_name = f'_sz_csr_{base_name}_data'
+        if (rows is not None and cols is not None and shape is not None
+                and data_name in csr_arrays):
+            pos = csr_point_positions(csr_arrays[f'_sz_csr_{base_name}_indptr'],
+                                      csr_arrays[f'_sz_csr_{base_name}_indices'],
+                                      shape, rows, cols)
+            if pos is not None:
+                param = f'_sz_pos_{len(point_positions)}'
+                point_positions.append(pos)
+                at = f'{data_name}[{param}[_sz_idx]]'
+                code = (at if pos.size == 0 or pos.min() >= 0
+                        else f'({at} if {param}[_sz_idx] >= 0 else 0.0)')
+        point_codes[key] = code
+        return code
+
     def _make_state():
         return {
             'acc_counter': 0,
@@ -2254,7 +2324,8 @@ def build_loop_jac_kernel_source(func_name: str,
             'var_map': var_map,
             'outer_name': outer_name,
             'sparse_walker_ctx': None,
-            'sparse_point_helpers': set(),
+            'sparse_point_helpers': point_helpers,
+            'point_position': _point_position if index_values is not None else None,
             'walker_args': frozenset(walker_names),
         }
 
@@ -2303,13 +2374,7 @@ def build_loop_jac_kernel_source(func_name: str,
         body_expr = _translate_loop_body_njit(canonical, state)
 
     helper_sources: List[str] = []
-    all_point_helpers = set()
-    if use_branches:
-        for st_key in [state] + [_make_state()]:
-            all_point_helpers |= st_key.get('sparse_point_helpers', set())
-    else:
-        all_point_helpers = state.get('sparse_point_helpers', set())
-    for walker_name in sorted(all_point_helpers):
+    for walker_name in sorted(point_helpers):
         params = ['row', 'col'] + _csr_point_args(walker_name, walker_names)
         helper_sources.append(
             f"def _sz_csr_{walker_name}_point({', '.join(params)}):\n"
@@ -2321,7 +2386,8 @@ def build_loop_jac_kernel_source(func_name: str,
             f"{indent}return 0.0\n"
         )
 
-    arg_list = list(symbols_list) + [row_arr_param, col_arr_param] + list(walker_names)
+    arg_list = (list(symbols_list) + [row_arr_param, col_arr_param] + list(walker_names)
+                + [f'_sz_pos_{n}' for n in range(len(point_positions))])
     lines = [
         f"def {func_name}({', '.join(arg_list)}):",
         f"{indent}data = np.empty({nnz})",
@@ -2344,7 +2410,52 @@ def build_loop_jac_kernel_source(func_name: str,
     lines.append(f"{indent}return data")
     kernel_source = '\n'.join(lines) + '\n'
 
-    return kernel_source, helper_sources
+    return kernel_source, helper_sources, point_positions
+
+
+def _eval_index_code(code: str, values, n: int):
+    """The translated index expression ``code`` evaluated at each of the
+    ``n`` positions of a sparse kernel, as an ``int64`` array, or None when
+    it depends on anything but ``values``, such as a ``Sum`` dummy or a Var,
+    or is not an integer."""
+    if values is None:
+        return None
+    try:
+        value = np.asarray(eval(code, {'__builtins__': {}}, dict(values)))
+    except Exception:
+        return None
+    if not np.issubdtype(value.dtype, np.integer):
+        return None
+    if value.ndim == 0:
+        return np.full(n, int(value), dtype=np.int64)
+    return value.astype(np.int64) if value.shape == (n,) else None
+
+
+def csr_point_positions(indptr, indices, shape, rows, cols):
+    """The position, in the CSR arrays ``indptr`` and ``indices`` of a
+    matrix of ``shape``, of the entry ``(rows[n], cols[n])`` for each ``n``.
+
+    The position is that of the first stored entry, the one that
+    ``_sz_csr_<M>_point`` returns, or -1 where no entry is stored. Returns
+    None when a row or a column is out of range.
+    """
+    n_rows, n_cols = shape
+    rows = np.asarray(rows, dtype=np.int64)
+    cols = np.asarray(cols, dtype=np.int64)
+    if rows.size and (rows.min() < 0 or rows.max() >= n_rows
+                      or cols.min() < 0 or cols.max() >= n_cols):
+        return None
+    stored_rows = np.repeat(np.arange(n_rows, dtype=np.int64), np.diff(indptr))
+    keys = stored_rows * n_cols + np.asarray(indices, dtype=np.int64)
+    # a stable sort, so ``first`` is the first occurrence in storage order
+    uniq, first = np.unique(keys, return_index=True)
+    wanted = rows * n_cols + cols
+    loc = np.searchsorted(uniq, wanted)
+    hit = loc < uniq.size
+    hit[hit] = uniq[loc[hit]] == wanted[hit]
+    pos = np.full(rows.size, -1, dtype=np.int64)
+    pos[hit] = first[loc[hit]]
+    return pos
 
 
 def _name_of(x) -> str:

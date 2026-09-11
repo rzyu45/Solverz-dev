@@ -358,6 +358,18 @@ def print_inner_J(var_addr: Address,
                     col_key = f'_sz_loop_jac_col_{block_idx}'
                     mut_mat_mappings[row_key] = jb.CooRow.astype(np.int64)
                     mut_mat_mappings[col_key] = jb.CooCol.astype(np.int64)
+                    # The kernel reads sparse Param entries at positions
+                    # computed for the pattern it was built with, so the
+                    # block must still have that pattern (issue #179).
+                    pos_keys = [f'_sz_loop_jac_pos_{block_idx}_{n}'
+                                for n in range(len(ed.point_pos_arrays))]
+                    if pos_keys and not (np.array_equal(jb.CooRow, ed._sparsity_row)
+                                         and np.array_equal(jb.CooCol, ed._sparsity_col)):
+                        raise RuntimeError(
+                            f"The Jacobian block d({eqn_name})/d({var.name}) has another "
+                            f"pattern than the one its LoopEqn kernel was built for")
+                    for key, pos in zip(pos_keys, ed.point_pos_arrays):
+                        mut_mat_mappings[key] = pos
 
                     mutable_matrix_blocks.append({
                         'addr_slice': addr_by_ele,
@@ -368,10 +380,13 @@ def print_inner_J(var_addr: Address,
                         'row_key': row_key,
                         'col_key': col_key,
                         'walker_args': list(ed.walker_arg_names),
-                        # the row / col arrays that inner_J must receive as
-                        # arguments, like the walker arrays above
+                        'pos_keys': pos_keys,
+                        # the row / col and position arrays that inner_J must
+                        # receive as arguments, like the walker arrays above
                         'row_col_args': [key for key in (row_key, col_key)
                                          if not numba_freezes(mut_mat_mappings[key])],
+                        'pos_args': [key for key in pos_keys
+                                     if not numba_freezes(mut_mat_mappings[key])],
                     })
                     addr_by_ele_0 += jb.SpEleSize
                     continue
@@ -475,8 +490,10 @@ def print_inner_J(var_addr: Address,
     # unit. Each kernel is itself ``@njit``-decorated, so the call
     # is inlined by numba at JIT time — no Python/numba boundary
     # crossing per kernel call at runtime. The row / col arrays of the
-    # kernels (``_sz_loop_jac_row_<N>`` / ``_sz_loop_jac_col_<N>``) and
-    # the CSR arrays of their sparse walkers are module-level globals.
+    # kernels (``_sz_loop_jac_row_<N>`` / ``_sz_loop_jac_col_<N>``), the
+    # CSR arrays of their sparse walkers and the positions of the sparse
+    # Param entries they read (``_sz_loop_jac_pos_<N>_<n>``) are
+    # module-level globals.
     # The ones Numba would not freeze enter ``inner_J`` as arguments from
     # the ``J_`` wrapper instead, because a global reference to such an
     # array makes Numba refuse to cache the function (issue #162). Every
@@ -486,19 +503,20 @@ def print_inner_J(var_addr: Address,
     for mb in mutable_matrix_blocks:
         if mb.get('mode') != 'loop_eqn':
             continue
-        for nm in list(mb['row_col_args']) + list(mb['walker_args']):
+        for nm in list(mb['row_col_args']) + list(mb['walker_args']) + list(mb['pos_args']):
             if nm not in extra_names:
                 extra_names.append(nm)
         kernel_args = [symbols(nm, real=True)
                        for nm in mb['kernel_symbols']]
         walker_syms = [symbols(nm, real=True) for nm in mb['walker_args']]
+        pos_syms = [symbols(nm, real=True) for nm in mb['pos_keys']]
         row_sym = symbols(mb['row_key'], real=True)
         col_sym = symbols(mb['col_key'], real=True)
         body.append(Assignment(
             iVar('_data_', internal_use=True)[mb['addr_slice']],
             FunctionCall(
                 mb['kernel_fn_name'],
-                kernel_args + [row_sym, col_sym] + walker_syms,
+                kernel_args + [row_sym, col_sym] + walker_syms + pos_syms,
             ),
         ))
 
