@@ -8,7 +8,7 @@ from copy import deepcopy
 import numpy as np
 from Solverz.equation.hvp import Hvp
 from sympy import Symbol, Integer, Expr, Number as SymNumber
-from scipy.sparse import csc_array, coo_array
+from scipy.sparse import csc_array, coo_array, issparse
 # from cvxopt import spmatrix, matrix
 
 from Solverz.equation.eqn import Eqn, Ode, EqnDiff, LoopEqn, LoopEqnDiff
@@ -87,20 +87,32 @@ class Equations:
            y,
            eqn_list: List[str] = None,
            var_list: List[str] = None,
-           eval_loop_kernels: bool = True) -> List[Tuple[str, str, EqnDiff, np.ndarray]]:
+           eval_loop_kernels: bool = True,
+           eval_mutable_diag: bool = True) -> List[Tuple[str, str, EqnDiff, np.ndarray]]:
         pass
 
-    def _eval_diff(self, eqn_name: str, key: str, y: Vars, t, eval_loop_kernels: bool):
+    def _eval_diff(self, eqn_name: str, key: str, y: Vars, t, eval_loop_kernels: bool,
+                   eval_mutable_diag: bool = True):
         """Evaluate one derivative, or return ``None`` for a ``LoopEqnDiff``
-        when ``eval_loop_kernels`` is false.
+        when ``eval_loop_kernels`` is false, and for a derivative that holds a
+        ``Diag`` and depends on a Var when ``eval_mutable_diag`` is false.
 
         ``FormJac`` needs only the sparsity pattern of a ``LoopEqnDiff``
         block, which the block already holds, so it skips the kernel. The
         kernel runs here in plain Python, and on a large model it took most
         of the time of ``render()`` (issue #180).
+
+        ``Diag`` evaluates as ``np.diagflat``, a dense n-by-n matrix. For a
+        derivative that depends on a Var, ``FormJac`` evaluates the block with
+        the sparse ``SpDiag`` in any case, so it skips the dense evaluation,
+        which cost memory and time in n squared (issue #185).
         """
         diff = self.EQNs[eqn_name].derivatives[key]
         if not eval_loop_kernels and isinstance(diff, LoopEqnDiff):
+            return None
+        if (not eval_mutable_diag and not isinstance(diff, LoopEqnDiff)
+                and diff.RHS.has(Diag)
+                and not is_constant_matrix_deri(diff.RHS, PARAM=self.PARAM)):
             return None
         return self.eval_diffs(eqn_name, key, *self.obtain_eqn_args(diff, y, t))
 
@@ -188,9 +200,11 @@ class Equations:
         self._warn_dense_matmul_params()
 
         # ``Fy`` leaves the value of every ``LoopEqnDiff`` block as
-        # ``None``, see the LoopEqn branch below.
+        # ``None``, see the LoopEqn branch below, and that of every
+        # derivative with ``Diag`` that depends on a Var, see the
+        # mutable-matrix branch.
         Fy_list = self.Fy(y, self.a.object_list, self.var_address.object_list,
-                          eval_loop_kernels=False)
+                          eval_loop_kernels=False, eval_mutable_diag=False)
 
         for fy in Fy_list:
             EqnName = fy[0]
@@ -264,9 +278,20 @@ class Equations:
             # expression or an ndarray with ``ndim == 2`` from a dense
             # one).
             fy_value = fy[3]
+            sparse_eqn = None
+            probed = fy_value is None
+            if probed:
+                # ``Fy`` skipped this derivative, which holds a ``Diag`` and
+                # depends on a Var, because ``np.diagflat`` would build a
+                # dense n-by-n matrix (issue #185). Its value with the
+                # sparse ``SpDiag`` tells whether the block is a matrix.
+                sparse_eqn = Eqn('_MutMatJb_' + EqnName + '_' + DiffVar.name,
+                                 DeriExpr.replace(Diag, SpDiag))
+                fy_value = sparse_eqn.NUM_EQN(*self.obtain_eqn_args(sparse_eqn, y, 0))
             fy_is_matrix = (
                 isinstance(fy_value, csc_array)
                 or (isinstance(fy_value, np.ndarray) and fy_value.ndim == 2)
+                or (probed and issparse(fy_value))
             )
             is_mutable_matrix_block = (
                 fy_is_matrix
@@ -280,9 +305,9 @@ class Equations:
             # so the runtime can do O(nnz) direct data copy without any
             # fancy indexing.
             if is_mutable_matrix_block:
-                sparse_expr = DeriExpr.replace(Diag, SpDiag)
-                sparse_eqn = Eqn('_MutMatJb_' + EqnName + '_' + DiffVar.name,
-                                 sparse_expr)
+                if sparse_eqn is None:
+                    sparse_eqn = Eqn('_MutMatJb_' + EqnName + '_' + DiffVar.name,
+                                     DeriExpr.replace(Diag, SpDiag))
                 sparse_args = self.obtain_eqn_args(sparse_eqn, y, 0)
                 # Perturb variable values with distinct non-zero samples so
                 # that ``sps.diags(v) @ M`` doesn't collapse to the empty
@@ -302,10 +327,10 @@ class Equations:
                     Value0 = csc_array(Value0)
             else:
                 # The value of deri can be either matrix, vector, or scalar.
-                if isinstance(fy[3], csc_array):
-                    Value0 = fy[3]
+                if isinstance(fy_value, csc_array):
+                    Value0 = fy_value
                 else:
-                    Value0 = np.array(fy[3])
+                    Value0 = np.array(fy_value)
 
             jb = JacBlock(EqnName,
                           EqnAddr,
@@ -581,13 +606,16 @@ class AE(Equations):
            y: Vars,
            eqn_list: List[str] = None,
            var_list: List[str] = None,
-           eval_loop_kernels: bool = True) -> List[Tuple[str, str, EqnDiff, np.ndarray]]:
+           eval_loop_kernels: bool = True,
+           eval_mutable_diag: bool = True) -> List[Tuple[str, str, EqnDiff, np.ndarray]]:
         """
         generate Jacobian matrices of Eqn object with respect to var object
         :param y:
         :param eqn_list:
         :param var_list:
         :param eval_loop_kernels: if False, the value of a ``LoopEqnDiff`` is None
+        :param eval_mutable_diag: if False, the value of a derivative with ``Diag``
+            that depends on a Var is None
         :return: List[Tuple[Equation_name, var_name, np.ndarray]]
         """
         if not eqn_list:
@@ -602,7 +630,8 @@ class AE(Equations):
             for var_name in var_list:
                 for key, value in eqn_diffs.items():
                     if var_name == value.diff_var_name:  # f is viewed as f[k]
-                        temp = self._eval_diff(eqn_name, key, y, 0, eval_loop_kernels)
+                        temp = self._eval_diff(eqn_name, key, y, 0, eval_loop_kernels,
+                                               eval_mutable_diag)
                         gy = [*gy, (eqn_name, var_name, eqn_diffs[key], temp)]
         return gy
 
@@ -610,8 +639,9 @@ class AE(Equations):
            y,
            eqn_list: List[str] = None,
            var_list: List[str] = None,
-           eval_loop_kernels: bool = True):
-        return self.gy(y, eqn_list, var_list, eval_loop_kernels)
+           eval_loop_kernels: bool = True,
+           eval_mutable_diag: bool = True):
+        return self.gy(y, eqn_list, var_list, eval_loop_kernels, eval_mutable_diag)
 
     def evalf(self, expr: Expr, y: Vars) -> np.ndarray:
         eqn = Eqn('Solverz evalf temporal equation', expr)
@@ -784,7 +814,8 @@ class DAE(Equations):
            y: Vars,
            eqn_list: List[str] = None,
            var_list: List[str] = None,
-           eval_loop_kernels: bool = True
+           eval_loop_kernels: bool = True,
+           eval_mutable_diag: bool = True
            ) -> List[Tuple[str, str, EqnDiff, np.ndarray]]:
         """
         generate partial derivatives of f w.r.t. y
@@ -805,7 +836,8 @@ class DAE(Equations):
             for var_name in var_list:
                 for key, value in eqn_diffs.items():
                     if var_name == value.diff_var_name:
-                        temp = self._eval_diff(eqn_name, key, y, t, eval_loop_kernels)
+                        temp = self._eval_diff(eqn_name, key, y, t, eval_loop_kernels,
+                                               eval_mutable_diag)
                         fy = [*fy, (eqn_name, var_name, eqn_diffs[key], temp)]
         return fy
 
@@ -814,7 +846,8 @@ class DAE(Equations):
            y: Vars,
            eqn_list: List[str] = None,
            var_list: List[str] = None,
-           eval_loop_kernels: bool = True
+           eval_loop_kernels: bool = True,
+           eval_mutable_diag: bool = True
            ) -> List[Tuple[str, str, EqnDiff, np.ndarray]]:
         """
         generate partial derivatives of g w.r.t. y
@@ -838,7 +871,8 @@ class DAE(Equations):
             for var_name in var_list:
                 for key, value in eqn_diffs.items():
                     if var_name == value.diff_var_name:
-                        temp = self._eval_diff(eqn_name, key, y, t, eval_loop_kernels)
+                        temp = self._eval_diff(eqn_name, key, y, t, eval_loop_kernels,
+                                               eval_mutable_diag)
                         gy = [*gy, (eqn_name, var_name, eqn_diffs[key], temp)]
         return gy
 
@@ -846,11 +880,12 @@ class DAE(Equations):
            y,
            eqn_list: List[str] = None,
            var_list: List[str] = None,
-           eval_loop_kernels: bool = True
+           eval_loop_kernels: bool = True,
+           eval_mutable_diag: bool = True
            ) -> List[Tuple[str, str, EqnDiff, np.ndarray]]:
-        fg_xy = self.fy(0, y, eqn_list, var_list, eval_loop_kernels)
+        fg_xy = self.fy(0, y, eqn_list, var_list, eval_loop_kernels, eval_mutable_diag)
         if len(self.g_list) > 0:
-            fg_xy.extend(self.gy(0, y, eqn_list, var_list, eval_loop_kernels))
+            fg_xy.extend(self.gy(0, y, eqn_list, var_list, eval_loop_kernels, eval_mutable_diag))
         return fg_xy
 
     @property
