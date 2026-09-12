@@ -163,9 +163,13 @@ def _fresh_common():
 class KLUSymbolic:
     """Owns a ``klu_symbolic*`` plus the pattern fingerprint it was built from.
 
-    The fingerprint is ``(shape, nnz, indptr)``. Solverz guarantees the pattern
-    is invariant within a run, so an ``indptr`` match (cheap, O(ncol)) together
-    with the same shape and nnz is a sufficient reuse condition in practice.
+    The fingerprint is ``(shape, nnz, indptr, indices)``. The row indices are
+    part of it because ``perm``, ``indices_p`` and ``gather`` below are
+    computed from them: a matrix with the ``indptr`` of this pattern and other
+    row indices would have its values gathered into this pattern, and KLU
+    would factorize another matrix without an error (issue #184). Comparing
+    them costs O(nnz), 0.09 ms for 926 416 entries against 56 ms for the
+    factorization they guard.
 
     ``perm`` is the row permutation applied before the analysis (``None`` when
     the matching is off or failed), ``indices_p`` the row indices of the
@@ -174,22 +178,24 @@ class KLUSymbolic:
     factorization of the same pattern costs one gather and no sort.
     """
 
-    __slots__ = ("ptr", "shape", "nnz", "indptr", "_common", "perm", "indices_p", "gather")
+    __slots__ = ("ptr", "shape", "nnz", "indptr", "indices", "_common", "perm", "indices_p", "gather")
 
-    def __init__(self, ptr, shape, nnz, indptr, common, perm=None, indices_p=None, gather=None):
+    def __init__(self, ptr, shape, nnz, indptr, indices, common, perm=None, indices_p=None, gather=None):
         self.ptr = ptr
         self.shape = shape
         self.nnz = nnz
         self.indptr = indptr           # int32 copy
+        self.indices = indices         # int32 copy
         self._common = common          # keep the Common used at analyze alive
         self.perm = perm
         self.indices_p = indices_p
         self.gather = gather
 
-    def matches(self, shape, nnz, indptr):
+    def matches(self, shape, nnz, indptr, indices):
         return (shape == self.shape and nnz == self.nnz
                 and indptr.shape == self.indptr.shape
-                and np.array_equal(indptr, self.indptr))
+                and np.array_equal(indptr, self.indptr)
+                and np.array_equal(indices, self.indices))
 
     def __del__(self):
         ptr = getattr(self, "ptr", None)
@@ -208,12 +214,16 @@ class KLUCache:
     Stored on the model (``dae``/``ae``/``fdae``) by the solver and threaded
     into :func:`Solverz.solvers.laesolver.lu_decomposition` so the BTF+AMD
     ordering is computed once and reused for every step of a run.
+    ``superlu`` holds the SuperLU column ordering of the same pattern, a
+    :class:`Solverz.solvers.laesolver.SuperLUOrdering`, which the SuperLU
+    backend reuses in the same way (issue #182).
     """
 
-    __slots__ = ("symbolic",)
+    __slots__ = ("symbolic", "superlu")
 
     def __init__(self):
         self.symbolic = None
+        self.superlu = None
 
 
 def _as_int32_csc(A):
@@ -294,7 +304,7 @@ class klu_decomposition:
         n = shape[0]
         Ap = indptr.ctypes.data_as(POINTER(c_int32))
 
-        if symbolic is not None and symbolic.ptr and symbolic.matches(shape, self.nnz, indptr):
+        if symbolic is not None and symbolic.ptr and symbolic.matches(shape, self.nnz, indptr, indices):
             self.symbolic = symbolic
         else:
             # ``matching=None`` follows the global switch and the size
@@ -311,7 +321,7 @@ class klu_decomposition:
             ptr = _lib.klu_analyze(n, Ap, Ai_a, byref(self._common))
             if not ptr:
                 raise RuntimeError(f"klu_analyze failed (status {self._common.status})")
-            self.symbolic = KLUSymbolic(ptr, shape, self.nnz, indptr.copy(), self._common,
+            self.symbolic = KLUSymbolic(ptr, shape, self.nnz, indptr.copy(), indices.copy(), self._common,
                                         perm=perm, indices_p=indices_p, gather=gather)
 
         sym = self.symbolic

@@ -1755,6 +1755,25 @@ def _probe_kron_entries(expr: sp.Expr,
     return entries
 
 
+def _csr_row_entries(indptr: np.ndarray, rows: np.ndarray):
+    """Positions of the stored entries of the CSR rows ``rows``, in order.
+
+    Returns ``(owner, pos)``: ``pos`` concatenates
+    ``range(indptr[r], indptr[r + 1])`` over ``r`` in ``rows``, and
+    ``owner[k]`` is the index into ``rows`` that produced ``pos[k]``. This is
+    the double loop over rows and their stored entries without a Python
+    object per entry (issue #181). ``rows`` is read with NumPy indexing, as
+    the loop it replaces read it, and a range whose end precedes its start
+    is empty, as Python's ``range`` is.
+    """
+    starts = indptr[rows].astype(np.int64)
+    counts = np.maximum(indptr[rows + 1].astype(np.int64) - starts, 0)
+    owner = np.repeat(np.arange(rows.size, dtype=np.int64), counts)
+    first = np.cumsum(counts) - counts
+    pos = np.repeat(starts - first, counts) + np.arange(owner.size, dtype=np.int64)
+    return owner, pos
+
+
 def compute_loop_jac_sparsity(canonical: sp.Expr,
                                 outer_idx: sp.Idx,
                                 diff_idx: sp.Idx,
@@ -1785,9 +1804,12 @@ def compute_loop_jac_sparsity(canonical: sp.Expr,
       pattern (conservatively safe).
 
     The returned ``(row_arr, col_arr)`` is the **sorted union** of
-    all term patterns in row-major order, so downstream
+    all term patterns in column-major order, so downstream
     ``JacBlock.ParseSp`` / ``csc_array`` conversion sees a
-    deterministic COO layout.
+    deterministic COO layout. Every fragment is kept as a pair of
+    ``int64`` arrays and the union is taken once, by one sort of a
+    linear index, so no structural nonzero passes through a Python
+    object (issue #181).
 
     Why this matters
     ----------------
@@ -1841,9 +1863,10 @@ def compute_loop_jac_sparsity(canonical: sp.Expr,
         return np.asarray(var_map[map_ref].v, dtype=np.int64).reshape(-1)
 
     # Each classified term contributes one or more (row, col)
-    # pattern fragments; we accumulate them here and union at
-    # the end.
-    all_positions: set = set()
+    # pattern fragments as ``int64`` arrays; we accumulate them here
+    # and union at the end.
+    frag_rows: List[np.ndarray] = []
+    frag_cols: List[np.ndarray] = []
     has_dense_fallback = False
 
     if isinstance(canonical, sp.Add):
@@ -1962,17 +1985,8 @@ def compute_loop_jac_sparsity(canonical: sp.Expr,
                     continue
                 if hasattr(val, 'tocsr'):
                     csr = val.tocsr()
-                    sub_rows_i = []
-                    sub_cols = []
-                    for i_outer, real_row in enumerate(row_map):
-                        start = int(csr.indptr[real_row])
-                        stop = int(csr.indptr[real_row + 1])
-                        cols_in_row = csr.indices[start:stop]
-                        for cc in cols_in_row:
-                            sub_rows_i.append(i_outer)
-                            sub_cols.append(int(cc))
-                    r = np.array(sub_rows_i, dtype=np.int64)
-                    c = np.array(sub_cols, dtype=np.int64)
+                    r, pos = _csr_row_entries(csr.indptr, row_map)
+                    c = csr.indices[pos].astype(np.int64)
                 else:
                     # Dense 2-D Param: every column of each selected
                     # row is a candidate structural nonzero. This is
@@ -1995,20 +2009,23 @@ def compute_loop_jac_sparsity(canonical: sp.Expr,
         if has_diag_kron:
             n = min(n_outer, n_diff)
             diag = np.arange(n, dtype=np.int64)
-            all_positions.update(zip(diag.tolist(), diag.tolist()))
+            frag_rows.append(diag)
+            frag_cols.append(diag)
 
         if has_indirect_diag_kron:
             row_map = _map_values(indirect_diag_map)
-            for i_outer, real_col in enumerate(row_map):
-                if 0 <= int(real_col) < n_diff:
-                    all_positions.add((int(i_outer), int(real_col)))
+            keep = (row_map >= 0) & (row_map < n_diff)
+            frag_rows.append(np.arange(row_map.size, dtype=np.int64)[keep])
+            frag_cols.append(row_map[keep].astype(np.int64))
 
         if has_probed_kron:
-            all_positions.update(probed_kron_entries)
+            entries = np.asarray(probed_kron_entries, dtype=np.int64).reshape(-1, 2)
+            frag_rows.append(entries[:, 0])
+            frag_cols.append(entries[:, 1])
 
-        if param_hits:
-            for r, c in param_hits:
-                all_positions.update(zip(r.tolist(), c.tolist()))
+        for r, c in param_hits:
+            frag_rows.append(r)
+            frag_cols.append(c)
 
         # --- Sum-KD pattern: a factor is ``Sum(... * KD(diff,
         # map[dummy]) * Param2D[row_expr, dummy] * ..., (dummy,
@@ -2095,23 +2112,18 @@ def compute_loop_jac_sparsity(canonical: sp.Expr,
                 row_map = (_map_values(sp_row_map)
                            if sp_row_map is not None else
                            np.arange(n_outer, dtype=np.int64))
-                for i_outer in range(n_outer):
-                    real_row = int(row_map[i_outer])
-                    start = int(csr.indptr[real_row])
-                    stop = int(csr.indptr[real_row + 1])
-                    for pos in range(start, stop):
-                        pp = int(csr.indices[pos])
-                        col = int(col_map[pp])
-                        if 0 <= col < n_diff:
-                            all_positions.add((i_outer, col))
+                owner, pos = _csr_row_entries(csr.indptr, row_map)
+                mapped = col_map[csr.indices[pos]]
+                keep = (mapped >= 0) & (mapped < n_diff)
+                frag_rows.append(owner[keep])
+                frag_cols.append(mapped[keep])
             else:
                 # No 2-D Param filter — every dummy value
                 # contributes to every row.
-                unique_cols = set(int(c) for c in col_map
-                                  if 0 <= int(c) < n_diff)
-                for i_outer in range(n_outer):
-                    for col in unique_cols:
-                        all_positions.add((i_outer, col))
+                unique_cols = np.unique(col_map[(col_map >= 0) & (col_map < n_diff)])
+                frag_rows.append(np.repeat(np.arange(n_outer, dtype=np.int64),
+                                           unique_cols.size))
+                frag_cols.append(np.tile(unique_cols, n_outer))
             has_sum_kd = True
             # Don't break — union sparsity from all Sum-KD atoms
 
@@ -2145,7 +2157,9 @@ def compute_loop_jac_sparsity(canonical: sp.Expr,
             stacklevel=3)
         return _dense_fallback()
 
-    if not all_positions:
+    rows = np.concatenate(frag_rows) if frag_rows else np.empty(0, dtype=np.int64)
+    cols = np.concatenate(frag_cols) if frag_cols else np.empty(0, dtype=np.int64)
+    if rows.size == 0:
         # Defensive: no terms produced structural positions. Fall
         # back to dense to guarantee correctness.
         return _dense_fallback()
@@ -2153,11 +2167,23 @@ def compute_loop_jac_sparsity(canonical: sp.Expr,
     # Sort by (col, row) — column-major, matching csc_array's
     # internal storage so ``csc_array((data, (row, col)), shape)
     # .tocoo()`` returns the indices in the same order we pass
-    # to the kernel builder.
-    sorted_positions = sorted(all_positions, key=lambda p: (p[1], p[0]))
-    row_arr = np.array([p[0] for p in sorted_positions], dtype=np.int64)
-    col_arr = np.array([p[1] for p in sorted_positions], dtype=np.int64)
-    return row_arr, col_arr
+    # to the kernel builder — and drop duplicates. Every fragment is
+    # non-negative, so with a stride above the largest row the linear
+    # index ``col * stride + row`` orders the positions as ``(col, row)``
+    # does. The stride is ``n_outer`` unless a transposed indirect
+    # term produced a row beyond the block. A sort and a comparison of
+    # neighbours, not ``np.unique``: NumPy 2.3's ``np.unique`` hashes
+    # before it sorts, which took 0.44 s of the 0.55 s on the four
+    # blocks of the 70 000-bus power flow, where the sort takes 0.04 s.
+    rows = rows.astype(np.int64, copy=False)
+    cols = cols.astype(np.int64, copy=False)
+    stride = max(int(n_outer), int(rows.max()) + 1)
+    lin = np.sort(cols * stride + rows)
+    first = np.empty(lin.size, dtype=bool)
+    first[0] = True
+    np.not_equal(lin[1:], lin[:-1], out=first[1:])
+    lin = lin[first]
+    return lin % stride, lin // stride
 
 
 def build_loop_jac_kernel_source(func_name: str,
@@ -2169,7 +2195,10 @@ def build_loop_jac_kernel_source(func_name: str,
                                    var_map: Dict[str, object],
                                    row_arr_param: str = '_sz_row_arr',
                                    col_arr_param: str = '_sz_col_arr',
-                                   walker_names=()) -> str:
+                                   walker_names=(),
+                                   row_arr=None,
+                                   col_arr=None,
+                                   csr_arrays=None):
     """Generate Python source for a **sparse** LoopEqn Jacobian
     block kernel.
 
@@ -2212,8 +2241,8 @@ def build_loop_jac_kernel_source(func_name: str,
         the ``range(nnz)`` loop.
     symbols_list : list of str
         Sorted Var/Param names that flow in as function arguments
-        BEFORE the row / col arrays. The full signature is
-        ``(<symbols>, <row_arr_param>, <col_arr_param>)``.
+        BEFORE the row / col arrays. The full signature is given
+        under Returns.
     var_map : dict
         IndexedBase name → Solverz Var/Param (passed through to
         ``_translate_loop_body_njit`` for the sparse-walker
@@ -2230,22 +2259,97 @@ def build_loop_jac_kernel_source(func_name: str,
         disables Numba's cache (issue #162). The kernel and the helpers
         read every other CSR array as a module-level global, which Numba
         compiles to a constant (issue #170).
+    row_arr, col_arr : ndarray of int, optional
+        The row and the column of each of the ``nnz`` positions, in the
+        order in which the kernel receives them. Together with
+        ``csr_arrays`` they let the kernel read an entry ``M[row, col]``
+        of a sparse 2-D Param, whose row and column follow from the
+        position alone, at a position in the CSR data of ``M`` computed
+        here, instead of searching row ``row`` of ``M`` at every call
+        (issue #179). Without them every such entry is read through the
+        search helper ``_sz_csr_<M>_point``.
+    csr_arrays : dict, optional
+        ``_sz_csr_<M>_data`` / ``_indices`` / ``_indptr`` → the array, for
+        the sparse 2-D Params of ``var_map``.
 
     Returns
     -------
-    str
+    kernel_source : str
         Full Python source for the kernel function, including the
         ``def`` line and a trailing newline. Ready to ``exec`` (for
         the inline path) or to ``@njit(cache=True)``-decorate and
-        paste into a module file (for the JIT path).
+        paste into a module file (for the JIT path). Its signature is
+        ``(<symbols>, <row_arr_param>, <col_arr_param>, <walker_names>,
+        _sz_pos_0, _sz_pos_1, ..., <hoisted>)``.
+    helper_sources : list of str
+        The sources of the ``_sz_csr_<M>_point`` search helpers that the
+        kernel calls.
+    point_positions : list of ndarray
+        One ``int64`` array of length ``nnz`` for each ``_sz_pos_<n>``
+        argument: the position of the entry the kernel reads in the CSR
+        data of its Param, or -1 where the Param stores no entry, which
+        reads as 0.0 as it does through the search helper.
+    hoisted : dict
+        The vectors the kernel reads, name → ``(np_func, var)``, such as
+        ``'_sz_h_cos_Va': ('np.cos', 'Va')``, which close its signature and
+        which the caller computes as ``np_func(var)`` once per call, so a
+        transcendental function of a Var entry is evaluated once per entry
+        and not once per use (issue #183).
     """
-    from Solverz.equation.eqn import _csr_point_args, _translate_loop_body_njit
+    from Solverz.equation.eqn import _csr_point_args, _hoisting, _translate_loop_body_njit
 
     outer_name = _name_of(outer_idx)
     diff_name = _name_of(diff_idx)
 
     indent = '    '
     body_indent = indent * 2
+
+    # Shared by every state below, so that the search helpers and the
+    # position arrays of the per-delta branches reach the kernel as well.
+    point_helpers: set = set()
+    point_positions: List[np.ndarray] = []
+    point_codes: Dict[Tuple[str, str, str], object] = {}
+    hoisted: Dict[str, Tuple[str, str]] = {}
+    hoist = _hoisting(var_map, hoisted)
+    index_values = None
+    if row_arr is not None and col_arr is not None and csr_arrays is not None:
+        # An index expression of the body is evaluated at every position
+        # against the outer and the diff index there and against the
+        # integer Params, which determine the pattern as the body does.
+        from Solverz.equation.param import ParamBase
+        index_values = {outer_name: np.asarray(row_arr, dtype=np.int64),
+                        diff_name: np.asarray(col_arr, dtype=np.int64)}
+        for nm, obj in var_map.items():
+            if (isinstance(obj, ParamBase)
+                    and not getattr(obj, 'triggerable', False)
+                    and not getattr(obj, 'sparse', False)
+                    and obj.v is not None):
+                value = np.asarray(obj.v)
+                if np.issubdtype(value.dtype, np.integer):
+                    index_values.setdefault(nm, value)
+
+    def _point_position(base_name, row_code, col_code):
+        key = (base_name, row_code, col_code)
+        if key in point_codes:
+            return point_codes[key]
+        code = None
+        rows = _eval_index_code(row_code, index_values, nnz)
+        cols = _eval_index_code(col_code, index_values, nnz)
+        shape = getattr(getattr(var_map.get(base_name), 'v', None), 'shape', None)
+        data_name = f'_sz_csr_{base_name}_data'
+        if (rows is not None and cols is not None and shape is not None
+                and data_name in csr_arrays):
+            pos = csr_point_positions(csr_arrays[f'_sz_csr_{base_name}_indptr'],
+                                      csr_arrays[f'_sz_csr_{base_name}_indices'],
+                                      shape, rows, cols)
+            if pos is not None:
+                param = f'_sz_pos_{len(point_positions)}'
+                point_positions.append(pos)
+                at = f'{data_name}[{param}[_sz_idx]]'
+                code = (at if pos.size == 0 or pos.min() >= 0
+                        else f'({at} if {param}[_sz_idx] >= 0 else 0.0)')
+        point_codes[key] = code
+        return code
 
     def _make_state():
         return {
@@ -2254,7 +2358,9 @@ def build_loop_jac_kernel_source(func_name: str,
             'var_map': var_map,
             'outer_name': outer_name,
             'sparse_walker_ctx': None,
-            'sparse_point_helpers': set(),
+            'sparse_point_helpers': point_helpers,
+            'point_position': _point_position if index_values is not None else None,
+            'hoist': hoist,
             'walker_args': frozenset(walker_names),
         }
 
@@ -2303,13 +2409,7 @@ def build_loop_jac_kernel_source(func_name: str,
         body_expr = _translate_loop_body_njit(canonical, state)
 
     helper_sources: List[str] = []
-    all_point_helpers = set()
-    if use_branches:
-        for st_key in [state] + [_make_state()]:
-            all_point_helpers |= st_key.get('sparse_point_helpers', set())
-    else:
-        all_point_helpers = state.get('sparse_point_helpers', set())
-    for walker_name in sorted(all_point_helpers):
+    for walker_name in sorted(point_helpers):
         params = ['row', 'col'] + _csr_point_args(walker_name, walker_names)
         helper_sources.append(
             f"def _sz_csr_{walker_name}_point({', '.join(params)}):\n"
@@ -2321,7 +2421,8 @@ def build_loop_jac_kernel_source(func_name: str,
             f"{indent}return 0.0\n"
         )
 
-    arg_list = list(symbols_list) + [row_arr_param, col_arr_param] + list(walker_names)
+    arg_list = (list(symbols_list) + [row_arr_param, col_arr_param] + list(walker_names)
+                + [f'_sz_pos_{n}' for n in range(len(point_positions))] + list(hoisted))
     lines = [
         f"def {func_name}({', '.join(arg_list)}):",
         f"{indent}data = np.empty({nnz})",
@@ -2344,7 +2445,52 @@ def build_loop_jac_kernel_source(func_name: str,
     lines.append(f"{indent}return data")
     kernel_source = '\n'.join(lines) + '\n'
 
-    return kernel_source, helper_sources
+    return kernel_source, helper_sources, point_positions, hoisted
+
+
+def _eval_index_code(code: str, values, n: int):
+    """The translated index expression ``code`` evaluated at each of the
+    ``n`` positions of a sparse kernel, as an ``int64`` array, or None when
+    it depends on anything but ``values``, such as a ``Sum`` dummy or a Var,
+    or is not an integer."""
+    if values is None:
+        return None
+    try:
+        value = np.asarray(eval(code, {'__builtins__': {}}, dict(values)))
+    except Exception:
+        return None
+    if not np.issubdtype(value.dtype, np.integer):
+        return None
+    if value.ndim == 0:
+        return np.full(n, int(value), dtype=np.int64)
+    return value.astype(np.int64) if value.shape == (n,) else None
+
+
+def csr_point_positions(indptr, indices, shape, rows, cols):
+    """The position, in the CSR arrays ``indptr`` and ``indices`` of a
+    matrix of ``shape``, of the entry ``(rows[n], cols[n])`` for each ``n``.
+
+    The position is that of the first stored entry, the one that
+    ``_sz_csr_<M>_point`` returns, or -1 where no entry is stored. Returns
+    None when a row or a column is out of range.
+    """
+    n_rows, n_cols = shape
+    rows = np.asarray(rows, dtype=np.int64)
+    cols = np.asarray(cols, dtype=np.int64)
+    if rows.size and (rows.min() < 0 or rows.max() >= n_rows
+                      or cols.min() < 0 or cols.max() >= n_cols):
+        return None
+    stored_rows = np.repeat(np.arange(n_rows, dtype=np.int64), np.diff(indptr))
+    keys = stored_rows * n_cols + np.asarray(indices, dtype=np.int64)
+    # a stable sort, so ``first`` is the first occurrence in storage order
+    uniq, first = np.unique(keys, return_index=True)
+    wanted = rows * n_cols + cols
+    loc = np.searchsorted(uniq, wanted)
+    hit = loc < uniq.size
+    hit[hit] = uniq[loc[hit]] == wanted[hit]
+    pos = np.full(rows.size, -1, dtype=np.int64)
+    pos[hit] = first[loc[hit]]
+    return pos
 
 
 def _name_of(x) -> str:

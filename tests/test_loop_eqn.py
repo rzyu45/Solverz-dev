@@ -3237,7 +3237,7 @@ def test_check_canonical_invariants_raises_on_a_lifted_delta():
 def _sin_walker_module(tmp_path, name, G):
     """Render ``b[i] - sum_j sin(G[i, j] x[j])`` with ``jit=True`` and return
     the generated ``num_func.py`` source. ``sin`` keeps the Jacobian a loop
-    kernel that reads ``G`` by point lookup."""
+    kernel that reads ``G[i, k]`` at every nonzero of the block."""
     n = G.shape[0]
     m = Model()
     m.x = Var('x', np.ones(n))
@@ -3288,7 +3288,9 @@ def test_loop_eqn_walker_above_one_megabyte_is_cached_by_numba(tmp_path):
     (issue #162). An array under the limit stays a module-level global even
     when its walker's other arrays are over it (issue #170): here ``indptr``
     holds 20 001 entries, 160 kB, while ``data``, ``indices`` and the
-    kernel's row and column arrays hold 170 000 entries, 1.36 MB each."""
+    kernel's row, column and position arrays hold 170 000 entries, 1.36 MB
+    each. The kernel reads ``G[i, k]`` at the position of the nonzero, and
+    no function searches a row of ``G`` (issue #179)."""
     import re
 
     from scipy.sparse import random as sp_random, eye as sp_eye
@@ -3308,14 +3310,15 @@ def test_loop_eqn_walker_above_one_megabyte_is_cached_by_numba(tmp_path):
     walkers = '_sz_csr_G_data, _sz_csr_G_indices'
     assert re.search(rf'def inner_F0\(.*{walkers}\):', src)
     assert re.search(rf'return inner_F\(_F_, .*{walkers}\)', src)
-    assert re.search(rf'def inner_J\(_data_, .*_sz_loop_jac_row_0, _sz_loop_jac_col_0, {walkers}\):', src)
-    assert re.search(rf'def _sz_csr_G_point\(row, col, {walkers}\):', src)
-    assert re.search(rf'_sz_loop_jac_kernel_0\(.*_sz_loop_jac_row_0, _sz_loop_jac_col_0, {walkers}\)', src)
+    pos = '_sz_loop_jac_pos_0_0'
+    assert re.search(rf'def inner_J\(_data_, .*_sz_loop_jac_row_0, _sz_loop_jac_col_0, {walkers}, {pos}\):', src)
+    assert '_sz_csr_G_point' not in src
+    assert re.search(rf'_sz_loop_jac_kernel_0\(.*_sz_loop_jac_row_0, _sz_loop_jac_col_0, {walkers}, {pos}\)', src)
     # indptr is read as the module-level global, and no function receives it
     assert '_sz_csr_G_indptr = setting["_sz_csr_G_indptr"]' in src
     assert not [p for _, p in re.findall(r'^def (\w+)\((.*)\):', src, re.M) if '_sz_csr_G_indptr' in p]
     _import_and_check_sin_walker(tmp_path, name, G,
-                                 ('inner_F0', 'inner_F', 'inner_J', '_sz_loop_jac_kernel_0', '_sz_csr_G_point'))
+                                 ('inner_F0', 'inner_F', 'inner_J', '_sz_loop_jac_kernel_0'))
 
 
 def test_loop_eqn_walker_under_the_freeze_limit_stays_a_global(tmp_path):
@@ -3336,12 +3339,12 @@ def test_loop_eqn_walker_under_the_freeze_limit_stays_a_global(tmp_path):
     signatures = dict(re.findall(r'^def (\w+)\((.*)\):', src, re.M))
     received = {fn: p for fn, p in signatures.items() if '_sz_csr_' in p or '_sz_loop_jac_' in p}
     assert received == {}
-    assert signatures['_sz_csr_G_point'] == 'row, col'
-    assert re.search(r'_sz_loop_jac_kernel_0\(.*_sz_loop_jac_row_0, _sz_loop_jac_col_0\)', src)
-    for part in ('data', 'indices', 'indptr'):
-        assert f'_sz_csr_G_{part} = setting["_sz_csr_G_{part}"]' in src
+    assert '_sz_csr_G_point' not in signatures
+    assert re.search(r'_sz_loop_jac_kernel_0\(.*_sz_loop_jac_row_0, _sz_loop_jac_col_0, _sz_loop_jac_pos_0_0\)', src)
+    for key in ('_sz_csr_G_data', '_sz_csr_G_indices', '_sz_csr_G_indptr', '_sz_loop_jac_pos_0_0'):
+        assert f'{key} = setting["{key}"]' in src
     _import_and_check_sin_walker(tmp_path, name, G,
-                                 ('inner_F0', 'inner_F', 'inner_J', '_sz_loop_jac_kernel_0', '_sz_csr_G_point'))
+                                 ('inner_F0', 'inner_F', 'inner_J', '_sz_loop_jac_kernel_0'))
 
 
 def test_numba_freeze_limit_matches_numba(tmp_path):
